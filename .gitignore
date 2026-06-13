@@ -1,0 +1,7 @@
+*-cache.json
+claude-cache.json
+codex-cache.json
+*.tmp
+*.tmp.*
+*.lock
+.DS_Store
