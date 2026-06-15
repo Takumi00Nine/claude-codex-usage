@@ -1,6 +1,7 @@
 *-cache.json
 claude-cache.json
 codex-cache.json
+claude-input.sig
 *.tmp
 *.tmp.*
 *.lock

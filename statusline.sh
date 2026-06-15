@@ -7,6 +7,7 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REFRESH="$BASE_DIR/refresh.sh"
 CODEX_CACHE="$BASE_DIR/codex-cache.json"
 CLAUDE_CACHE="$BASE_DIR/claude-cache.json"
+CLAUDE_SIG="$BASE_DIR/claude-input.sig"
 CACHE_TTL=300
 NOW="$(date +%s 2>/dev/null)"
 INPUT="$(cat 2>/dev/null)"
@@ -140,24 +141,50 @@ background_refresh() {
 model="$(jq -r '.model.display_name // "Claude"' <<<"$INPUT" 2>/dev/null)"
 [ -n "$model" ] && [ "$model" != "null" ] || model="Claude"
 
-claude_5h="$(jq -r '.rate_limits.five_hour.used_percentage // .rate_limits.five_hour.utilization // empty' <<<"$INPUT" 2>/dev/null)"
-claude_week="$(jq -r '.rate_limits.seven_day.used_percentage // .rate_limits.seven_day.utilization // empty' <<<"$INPUT" 2>/dev/null)"
-claude_5h_reset="$(jq -r '.rate_limits.five_hour.resets_at // empty' <<<"$INPUT" 2>/dev/null)"
-claude_5h_kind=epoch
+# Usage values Claude Code hands us on stdin; these are only refreshed by the
+# harness after a prompt is sent, so they are the freshest source right then.
+input_5h="$(jq -r '.rate_limits.five_hour.used_percentage // .rate_limits.five_hour.utilization // empty' <<<"$INPUT" 2>/dev/null)"
+input_week="$(jq -r '.rate_limits.seven_day.used_percentage // .rate_limits.seven_day.utilization // empty' <<<"$INPUT" 2>/dev/null)"
+input_5h_reset="$(jq -r '.rate_limits.five_hour.resets_at // empty' <<<"$INPUT" 2>/dev/null)"
 
-if ! valid_percent "$claude_5h" || ! valid_percent "$claude_week"; then
-  if [ -r "$CLAUDE_CACHE" ] && [ "$(cache_age "$CLAUDE_CACHE")" -le "$CACHE_TTL" ] 2>/dev/null; then
-    if ! valid_percent "$claude_5h"; then
-      claude_5h="$(jq -r '.five_hour.utilization // empty' "$CLAUDE_CACHE" 2>/dev/null)"
-      claude_5h_reset="$(jq -r '.five_hour.resets_at // empty' "$CLAUDE_CACHE" 2>/dev/null)"
-      claude_5h_kind=iso
-    fi
-    if ! valid_percent "$claude_week"; then
-      claude_week="$(jq -r '.seven_day.utilization // empty' "$CLAUDE_CACHE" 2>/dev/null)"
-    fi
-  else
+# A new prompt is the only thing that changes the stdin payload; detect that by
+# comparing against the last signature so we can update immediately on a prompt.
+input_fresh=0
+if valid_percent "$input_5h" && valid_percent "$input_week"; then
+  sig="${input_5h}|${input_week}|${input_5h_reset}"
+  if [ "$sig" != "$(cat "$CLAUDE_SIG" 2>/dev/null)" ]; then
+    input_fresh=1
+    printf '%s' "$sig" >"$CLAUDE_SIG.tmp.$$" 2>/dev/null &&
+      mv -f "$CLAUDE_SIG.tmp.$$" "$CLAUDE_SIG" 2>/dev/null
     background_refresh claude
   fi
+fi
+
+# Refresh the cache on a five-minute cadence so the value advances while idle,
+# mirroring how the Codex side stays current without a prompt.
+if [ ! -r "$CLAUDE_CACHE" ] || [ "$(cache_age "$CLAUDE_CACHE")" -gt "$CACHE_TTL" ] 2>/dev/null; then
+  background_refresh claude
+fi
+
+if [ "$input_fresh" = 1 ]; then
+  # Just sent a prompt: show the value Claude Code handed us right away.
+  claude_5h="$input_5h"
+  claude_week="$input_week"
+  claude_5h_reset="$input_5h_reset"
+  claude_5h_kind=epoch
+else
+  # Idle: read the background-refreshed cache so the percentage keeps updating.
+  claude_5h="$(jq -r '.five_hour.utilization // empty' "$CLAUDE_CACHE" 2>/dev/null)"
+  claude_week="$(jq -r '.seven_day.utilization // empty' "$CLAUDE_CACHE" 2>/dev/null)"
+  claude_5h_reset="$(jq -r '.five_hour.resets_at // empty' "$CLAUDE_CACHE" 2>/dev/null)"
+  claude_5h_kind=iso
+  # Fall back to the stdin values until the cache is populated.
+  if ! valid_percent "$claude_5h"; then
+    claude_5h="$input_5h"
+    claude_5h_reset="$input_5h_reset"
+    claude_5h_kind=epoch
+  fi
+  valid_percent "$claude_week" || claude_week="$input_week"
 fi
 
 codex_5h=""
