@@ -67,6 +67,26 @@ For Codex, `refresh.sh` starts `codex app-server` in the background and sends th
 
 Caches have a five-minute TTL. Refreshes use `flock` when available and an atomic `mkdir` lock on standard macOS installations. Statusline rendering never waits for network or app-server refreshes.
 
+## Optional: Keep refreshing while idle (launchd)
+By default the caches refresh only when the status line re-renders, which happens while you are actively using Claude Code. If you leave it idle, the values stop advancing. To refresh every five minutes regardless of activity, run `refresh.sh` from a per-user LaunchAgent.
+
+Use a LaunchAgent rather than `cron`: a LaunchAgent runs inside your GUI login session, so it can read the Claude token from Keychain. `cron` runs in a context without Keychain access (Keychain lives under the TCC-protected `~/Library`), so the Claude refresh fails there unless you grant Full Disk Access to `/usr/sbin/cron`.
+
+1. Copy the template and edit the paths:
+   ```bash
+   cp com.usage-statusline.refresh.plist.example ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
+   ```
+   In the copied file, set `ProgramArguments` to the absolute path of your `refresh.sh`, and set `PATH` so that `codex` is reachable (run `command -v codex` and add its directory — often a version-manager shim dir such as `~/.anyenv/envs/nodenv/shims`).
+2. Load it:
+   ```bash
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
+   launchctl enable gui/$(id -u)/com.usage-statusline.refresh
+   launchctl kickstart -k gui/$(id -u)/com.usage-statusline.refresh   # run once now to verify
+   ```
+   Check status with `launchctl print gui/$(id -u)/com.usage-statusline.refresh` and logs at `/tmp/usage-refresh.log`. To remove it later: `launchctl bootout gui/$(id -u)/com.usage-statusline.refresh`.
+
+The Claude OAuth usage endpoint also enforces a request-rate limit (separate from your plan quota; it does not consume tokens). A five-minute interval is well within it, but refreshing many times in quick succession can return HTTP 429 until a short cooldown passes.
+
 ## Caveats
 - The Claude OAuth endpoint and Codex app-server JSON-RPC method are unofficial and undocumented. Updates to either CLI may break this tool without notice.
 - Claude usage targets Pro/Max subscriptions. Codex usage targets the rate limits associated with a ChatGPT subscription.
@@ -153,6 +173,26 @@ Claude OAuth トークンは、最初に macOS Keychain、次に `~/.claude/.cre
 Codex については、`refresh.sh` がバックグラウンドで `codex app-server` を起動し、JSON-RPC メソッド `account/rateLimits/read` を送信します。そのレスポンスは `codex-cache.json` に保存されます。
 
 キャッシュの TTL は5分です。更新処理は、利用可能な場合は `flock` を使用し、標準的な macOS 環境ではアトミックな `mkdir` ロックを使用します。ステータスラインの表示がネットワークまたは app-server の更新を待つことはありません。
+
+## オプション: アイドル中も更新し続ける（launchd）
+既定では、キャッシュはステータスラインが再描画されたとき（＝Claude Code を操作している間）にのみ更新されます。放置すると値が進まなくなります。操作の有無に関わらず5分ごとに更新するには、ユーザーごとの LaunchAgent から `refresh.sh` を実行します。
+
+`cron` ではなく LaunchAgent を使ってください。LaunchAgent は GUI ログインセッション内で動くため Keychain から Claude トークンを読めます。`cron` は Keychain にアクセスできないコンテキストで動く（Keychain は TCC 保護下の `~/Library` にある）ため、`/usr/sbin/cron` に Full Disk Access を付与しない限り Claude の更新が失敗します。
+
+1. テンプレートをコピーしてパスを編集します:
+   ```bash
+   cp com.usage-statusline.refresh.plist.example ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
+   ```
+   コピーしたファイルで、`ProgramArguments` を自分の `refresh.sh` の絶対パスに設定し、`codex` に到達できるよう `PATH` を設定します（`command -v codex` で場所を確認し、そのディレクトリ——多くはバージョン管理ツールの shim ディレクトリ `~/.anyenv/envs/nodenv/shims` 等——を追加）。
+2. 読み込みます:
+   ```bash
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
+   launchctl enable gui/$(id -u)/com.usage-statusline.refresh
+   launchctl kickstart -k gui/$(id -u)/com.usage-statusline.refresh   # 動作確認のため即時1回実行
+   ```
+   状態は `launchctl print gui/$(id -u)/com.usage-statusline.refresh`、ログは `/tmp/usage-refresh.log` で確認できます。解除するには `launchctl bootout gui/$(id -u)/com.usage-statusline.refresh`。
+
+Claude OAuth 使用量エンドポイントには、リクエスト回数のレート制限もあります（プランの枠とは別で、トークンは消費しません）。5分間隔なら十分に余裕がありますが、短時間に何度も更新すると、短いクールダウンが過ぎるまで HTTP 429 が返ることがあります。
 
 ## 注意事項
 - Claude OAuth エンドポイントと Codex app-server の JSON-RPC メソッドは非公式かつ文書化されていません。いずれかの CLI が更新されると、予告なくこのツールが動作しなくなる可能性があります。

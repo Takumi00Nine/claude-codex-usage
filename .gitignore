@@ -6,3 +6,6 @@ claude-input.sig
 *.tmp.*
 *.lock
 .DS_Store
+
+# Ignore a personalized LaunchAgent plist, but keep the *.plist.example template.
+*.plist

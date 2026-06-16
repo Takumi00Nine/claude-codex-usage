@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.usage-statusline.refresh</string>
+
+    <!-- Replace with the absolute path where you cloned this repository. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/absolute/path/to/usage-statusline/refresh.sh</string>
+        <string>all</string>
+    </array>
+
+    <!-- launchd uses a minimal PATH. Make sure `codex`, `jq`, and `curl` are
+         all reachable. Add the directory that actually contains `codex`
+         (run `command -v codex` to find it; e.g. a version-manager shim dir
+         such as ~/.anyenv/envs/nodenv/shims). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Run every 5 minutes, and once immediately at load. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/usage-refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/usage-refresh.log</string>
+</dict>
+</plist>
