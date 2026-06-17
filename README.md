@@ -1,215 +1,125 @@
-# Claude and Codex Usage Statusline
+# claude-codex-usage
 
 **English** | [日本語](#日本語)
 
-A lightweight Claude Code status line that shows Claude (Anthropic) and Codex (OpenAI/ChatGPT) plan usage.
+Show **Claude (Anthropic)** and **Codex (OpenAI/ChatGPT)** plan usage in the **tmux status bar**.
+A background agent fetches usage every 5 minutes; a tmux segment renders it as colored gauges with a reset countdown.
 
 ```text
-🤖 Opus │ ✳️ Claude ▏█████░░░░░ 51% ↻2h13m (週 6%) │ ⬢ Codex ▏█░░░░░░░░░ 6% ↻4h44m (週 14%)
+CL 5h ██████░░ 80% ↻1:51:28  7d ███░░░░░ 43% │ CX 5h ░░░░░░░░ 2% ↻4:12:23  7d ░░░░░░░░ 4%
 ```
 
-The label `週` means "weekly": the bar and reset timer show the five-hour window, while the percentage in parentheses shows weekly usage.
+- `CL` = Claude, `CX` = Codex. `5h` = 5-hour window, `7d` = weekly window.
+- `↻H:MM:SS` = time until the 5-hour window resets.
+- Gauge color: green `<50%`, orange `50–80%`, red `≥80%`.
 
-## Features
-- Shows each five-hour allowance as a bar, percentage, and time until reset
-- Shows weekly usage as a compact percentage in parentheses
-- Colors usage green through 50%, yellow through 80%, and red above 80%
-- Displays both Claude and Codex plan usage in one status line
-- Keeps rendering lightweight and non-blocking by refreshing slow data in the background
+## Components
+
+| File | Role |
+|---|---|
+| `refresh.sh` | Fetches Claude (OAuth usage API) and Codex (`codex app-server`) usage, writes `claude-cache.json` / `codex-cache.json`. Network + **read-only** token use (no quota consumed). |
+| `tmux-usage.sh` | Reads the caches and prints a colored tmux status segment. **No network** — cheap to call every second. |
+| `com.claude-codex-usage.refresh.plist.example` | LaunchAgent template that runs `refresh.sh all` every 5 minutes (so values advance while idle). |
+
+## How it works
+
+```
+launchd (every 5 min) ─▶ refresh.sh ─▶ *-cache.json ─▶ tmux-usage.sh ─▶ tmux status-right
+```
+
+`refresh.sh` is the only writer of the caches; `tmux-usage.sh` only reads them. Decoupling the
+fetch (slow, network) from the render (fast, local) keeps the status bar instant.
 
 ## Requirements
-- macOS
-- Bash
-- [`jq`](https://jqlang.github.io/jq/)
-- `curl`
-- [Codex CLI](https://github.com/openai/codex), installed and signed in
-- Claude Code, signed in to a Pro or Max plan
+- macOS, `jq`, `curl`, `tmux`
+- **Claude**: logged in to Claude Code (OAuth token in the login keychain)
+- **Codex**: `codex` CLI reachable on `PATH` (e.g. a version-manager shim dir like `~/.anyenv/envs/nodenv/shims`)
 
-This tool currently requires macOS because it reads Claude credentials from Keychain and uses BSD `date -j`. Linux support requires adjustments to credential lookup and date parsing.
+## Setup
 
-## Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Takumi00Nine/usage-statusline.git
-   cd usage-statusline
-   ```
-2. Make the scripts executable:
-   ```bash
-   chmod +x *.sh
-   ```
-3. Add a `statusLine` entry to `~/.claude/settings.json`. Set `command` to the absolute path where you cloned the repository:
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "/absolute/path/to/usage-statusline/statusline.sh",
-       "padding": 0
-     }
-   }
-   ```
-Merge the `statusLine` key into your existing settings object if the file already contains other settings. The first render may show `--` until the background refresh finishes.
+### 1. tmux status bar
+Add to `~/.tmux.conf` (use the absolute path where you cloned this repo):
 
-## How It Works
-`statusline.sh` is called by Claude Code and always returns quickly. Both Claude and Codex usage are displayed from background-refreshed caches with a five-minute TTL, so the values keep advancing even while idle.
-
-Claude Code only updates the usage data on statusline stdin when you submit a prompt, so it cannot drive a continuously updating display on its own. Instead, Claude usage refreshes through the unofficial Claude OAuth usage endpoint:
-```text
-https://api.anthropic.com/api/oauth/usage
+```tmux
+set -g status-interval 1    # so the ↻ countdown ticks per second
+set -g status-right "#(/absolute/path/to/claude-codex-usage/tmux-usage.sh) %H:%M "
 ```
-The Claude OAuth token is read from macOS Keychain first, then from `~/.claude/.credentials.json`. The response is stored in `claude-cache.json`. The stdin fields are still used for instant updates the moment you submit a prompt:
-- `rate_limits.five_hour.used_percentage`
-- `rate_limits.five_hour.resets_at` as an epoch timestamp
-- `rate_limits.seven_day.used_percentage`
 
-A new prompt is detected by comparing the stdin values against the last signature saved in `claude-input.sig`. When it changes, the stdin value is shown immediately and a refresh is triggered; otherwise the display comes from `claude-cache.json`. The result is that Claude usage updates every five minutes while idle and instantly on each prompt.
+Reload: `tmux source-file ~/.tmux.conf`.
 
-For Codex, `refresh.sh` starts `codex app-server` in the background and sends the JSON-RPC method `account/rateLimits/read`. Its response is stored in `codex-cache.json`.
+### 2. Background refresh (launchd)
+launchd is used (not cron) because the Claude token lives in the keychain, which is TCC-protected:
+a per-user LaunchAgent runs in the GUI session and can read it without Full Disk Access; cron cannot.
 
-Caches have a five-minute TTL. Refreshes use `flock` when available and an atomic `mkdir` lock on standard macOS installations. Statusline rendering never waits for network or app-server refreshes.
-
-## Optional: Keep refreshing while idle (launchd)
-By default the caches refresh only when the status line re-renders, which happens while you are actively using Claude Code. If you leave it idle, the values stop advancing. To refresh every five minutes regardless of activity, run `refresh.sh` from a per-user LaunchAgent.
-
-Use a LaunchAgent rather than `cron`: a LaunchAgent runs inside your GUI login session, so it can read the Claude token from Keychain. `cron` runs in a context without Keychain access (Keychain lives under the TCC-protected `~/Library`), so the Claude refresh fails there unless you grant Full Disk Access to `/usr/sbin/cron`.
-
-1. Copy the template and edit the paths:
-   ```bash
-   cp com.usage-statusline.refresh.plist.example ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
-   ```
-   In the copied file, set `ProgramArguments` to the absolute path of your `refresh.sh`, and set `PATH` so that `codex` is reachable (run `command -v codex` and add its directory — often a version-manager shim dir such as `~/.anyenv/envs/nodenv/shims`).
-2. Load it:
-   ```bash
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
-   launchctl enable gui/$(id -u)/com.usage-statusline.refresh
-   launchctl kickstart -k gui/$(id -u)/com.usage-statusline.refresh   # run once now to verify
-   ```
-   Check status with `launchctl print gui/$(id -u)/com.usage-statusline.refresh` and logs at `/tmp/usage-refresh.log`. To remove it later: `launchctl bootout gui/$(id -u)/com.usage-statusline.refresh`.
-
-The Claude OAuth usage endpoint also enforces a request-rate limit (separate from your plan quota; it does not consume tokens). A five-minute interval is well within it, but refreshing many times in quick succession can return HTTP 429 until a short cooldown passes.
+```sh
+cp com.claude-codex-usage.refresh.plist.example ~/Library/LaunchAgents/com.claude-codex-usage.refresh.plist
+# edit the file: set refresh.sh's absolute path and a PATH that contains `codex`, `jq`, `curl`
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-codex-usage.refresh.plist
+launchctl enable    gui/$(id -u)/com.claude-codex-usage.refresh
+launchctl kickstart -k gui/$(id -u)/com.claude-codex-usage.refresh   # run once now
+```
 
 ## Caveats
-- The Claude OAuth endpoint and Codex app-server JSON-RPC method are unofficial and undocumented. Updates to either CLI may break this tool without notice.
-- Claude usage targets Pro/Max subscriptions. Codex usage targets the rate limits associated with a ChatGPT subscription.
-- Cache files (`*-cache.json`) and `claude-input.sig` contain plan and usage data. They are excluded from Git by `.gitignore` and should not be committed.
-
-## Troubleshooting
-### Values stay at `--`
-Confirm that Claude Code and Codex CLI are signed in. The relevant unofficial endpoint or JSON-RPC response may also have changed.
-### Colors do not appear
-Confirm that your terminal and Claude Code status line render ANSI color escape sequences. Also verify that the reported values are numeric percentages.
-### Values are stale
-Both caches refresh only after the status line runs and notices a missing or expired (older than five minutes) cache. Render the status line again, or refresh manually:
-```bash
-/absolute/path/to/usage-statusline/refresh.sh codex
-/absolute/path/to/usage-statusline/refresh.sh claude
-```
+- The Claude usage endpoint (`api.anthropic.com/api/oauth/usage`) does **not** consume your token quota, but it has its **own request-rate limit** (HTTP 429). A 5-minute cadence (288/day) is fine; hammering it while debugging will trip 429 (clears in minutes).
+- launchd uses a minimal `PATH`; set `PATH` in the plist so `codex` is found.
+- Cache files (`*-cache.json`) hold usage data and are git-ignored — do not commit them.
 
 ## License
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE)
+
+---
 
 ## 日本語
 
-Claude（Anthropic）と Codex（OpenAI/ChatGPT）のプラン使用量を表示する、軽量な Claude Code ステータスラインです。
+**Claude（Anthropic）** と **Codex（OpenAI/ChatGPT）** のプラン使用率を **tmux のステータスバー**に表示するツール。バックグラウンドのエージェントが5分ごとに使用率を取得し、tmux セグメントが色付きゲージ＋リセットまでのカウントダウンで描画する。
 
 ```text
-🤖 Opus │ ✳️ Claude ▏█████░░░░░ 51% ↻2h13m (週 6%) │ ⬢ Codex ▏█░░░░░░░░░ 6% ↻4h44m (週 14%)
+CL 5h ██████░░ 80% ↻1:51:28  7d ███░░░░░ 43% │ CX 5h ░░░░░░░░ 2% ↻4:12:23  7d ░░░░░░░░ 4%
 ```
 
-ラベル `週` は週次を意味します。バーとリセットタイマーは5時間枠を示し、括弧内のパーセンテージは週次使用量を示します。
+- `CL`=Claude / `CX`=Codex。`5h`=5時間枠、`7d`=週枠。
+- `↻時:分:秒` = 5時間枠がリセットされるまでの残り時間。
+- ゲージ色: 緑 `<50%` / 橙 `50〜80%` / 赤 `≥80%`。
 
-## 機能
-- 各5時間枠を、バー、パーセンテージ、リセットまでの時間で表示
-- 週次使用量を括弧内にコンパクトなパーセンテージで表示
-- 使用量が50%以下の場合は緑、80%以下の場合は黄、80%を超える場合は赤で表示
-- Claude と Codex のプラン使用量を1つのステータスラインに表示
-- 時間のかかるデータ更新をバックグラウンドで行い、軽量かつノンブロッキングな表示を維持
+### 構成
+| ファイル | 役割 |
+|---|---|
+| `refresh.sh` | Claude（OAuth usage API）と Codex（`codex app-server`）の使用率を取得し `claude-cache.json` / `codex-cache.json` に書く。ネット通信あり・トークンは**読み取りのみ**（枠を消費しない）。 |
+| `tmux-usage.sh` | キャッシュを読んで色付き tmux セグメントを出力。**通信なし**＝毎秒呼んでも軽い。 |
+| `com.claude-codex-usage.refresh.plist.example` | `refresh.sh all` を5分ごとに実行する LaunchAgent テンプレ（アイドル中も値が進む）。 |
 
-## 必要環境
-- macOS
-- Bash
-- [`jq`](https://jqlang.github.io/jq/)
-- `curl`
-- [Codex CLI](https://github.com/openai/codex)（インストール済みかつサインイン済み）
-- Claude Code（Pro または Max プランにサインイン済み）
-
-このツールは Claude の認証情報を Keychain から読み取り、BSD `date -j` を使用するため、現在は macOS が必要です。Linux をサポートするには、認証情報の検索と日付解析を調整する必要があります。
-
-## インストール
-1. リポジトリをクローンします:
-   ```bash
-   git clone https://github.com/Takumi00Nine/usage-statusline.git
-   cd usage-statusline
-   ```
-2. スクリプトを実行可能にします:
-   ```bash
-   chmod +x *.sh
-   ```
-3. `~/.claude/settings.json` に `statusLine` エントリを追加します。`command` には、リポジトリをクローンした場所の絶対パスを設定します:
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "/absolute/path/to/usage-statusline/statusline.sh",
-       "padding": 0
-     }
-   }
-   ```
-ファイルに他の設定がすでに含まれている場合は、既存の設定オブジェクトに `statusLine` キーをマージしてください。バックグラウンド更新が完了するまで、初回表示では `--` と表示される場合があります。
-
-## 仕組み
-`statusline.sh` は Claude Code から呼び出され、常にすばやく応答します。Claude と Codex の使用量は、いずれも TTL 5分のバックグラウンド更新キャッシュから表示するため、アイドル中でも値が更新され続けます。
-
-Claude Code がステータスラインの stdin に渡す使用量データは、プロンプトを送信したときにしか更新されません。そのため、それ単体では継続的に更新される表示を作れません。代わりに Claude の使用量は、非公式の Claude OAuth 使用量エンドポイント経由で更新します:
-```text
-https://api.anthropic.com/api/oauth/usage
+### 仕組み
 ```
-Claude OAuth トークンは、最初に macOS Keychain、次に `~/.claude/.credentials.json` から読み取られます。レスポンスは `claude-cache.json` に保存されます。プロンプト送信直後の即時更新には、引き続き stdin の次のフィールドを使用します:
-- `rate_limits.five_hour.used_percentage`
-- エポックタイムスタンプとしての `rate_limits.five_hour.resets_at`
-- `rate_limits.seven_day.used_percentage`
+launchd（5分毎） ─▶ refresh.sh ─▶ *-cache.json ─▶ tmux-usage.sh ─▶ tmux status-right
+```
+キャッシュを書くのは `refresh.sh` だけ、読むのは `tmux-usage.sh` だけ。取得（遅い・通信）と描画（速い・ローカル）を分離してバーを即時化している。
 
-新しいプロンプトの検出は、stdin の値を `claude-input.sig` に保存した前回のシグネチャと比較して行います。変化していれば stdin の値を即座に表示し、更新もトリガーします。変化していなければ `claude-cache.json` から表示します。これにより Claude の使用量は、アイドル中は5分ごと、プロンプトごとには即座に更新されます。
+### 必要環境
+- macOS、`jq`、`curl`、`tmux`
+- **Claude**: Claude Code にログイン済み（OAuth トークンがログイン keychain にある）
+- **Codex**: `codex` CLI が `PATH` から見える（例: `~/.anyenv/envs/nodenv/shims` のような version-manager の shim ディレクトリ）
 
-Codex については、`refresh.sh` がバックグラウンドで `codex app-server` を起動し、JSON-RPC メソッド `account/rateLimits/read` を送信します。そのレスポンスは `codex-cache.json` に保存されます。
+### セットアップ
+**1. tmux バー**（`~/.tmux.conf` に追記、パスは clone した絶対パスに）:
+```tmux
+set -g status-interval 1
+set -g status-right "#(/absolute/path/to/claude-codex-usage/tmux-usage.sh) %H:%M "
+```
+反映: `tmux source-file ~/.tmux.conf`。
 
-キャッシュの TTL は5分です。更新処理は、利用可能な場合は `flock` を使用し、標準的な macOS 環境ではアトミックな `mkdir` ロックを使用します。ステータスラインの表示がネットワークまたは app-server の更新を待つことはありません。
-
-## オプション: アイドル中も更新し続ける（launchd）
-既定では、キャッシュはステータスラインが再描画されたとき（＝Claude Code を操作している間）にのみ更新されます。放置すると値が進まなくなります。操作の有無に関わらず5分ごとに更新するには、ユーザーごとの LaunchAgent から `refresh.sh` を実行します。
-
-`cron` ではなく LaunchAgent を使ってください。LaunchAgent は GUI ログインセッション内で動くため Keychain から Claude トークンを読めます。`cron` は Keychain にアクセスできないコンテキストで動く（Keychain は TCC 保護下の `~/Library` にある）ため、`/usr/sbin/cron` に Full Disk Access を付与しない限り Claude の更新が失敗します。
-
-1. テンプレートをコピーしてパスを編集します:
-   ```bash
-   cp com.usage-statusline.refresh.plist.example ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
-   ```
-   コピーしたファイルで、`ProgramArguments` を自分の `refresh.sh` の絶対パスに設定し、`codex` に到達できるよう `PATH` を設定します（`command -v codex` で場所を確認し、そのディレクトリ——多くはバージョン管理ツールの shim ディレクトリ `~/.anyenv/envs/nodenv/shims` 等——を追加）。
-2. 読み込みます:
-   ```bash
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.usage-statusline.refresh.plist
-   launchctl enable gui/$(id -u)/com.usage-statusline.refresh
-   launchctl kickstart -k gui/$(id -u)/com.usage-statusline.refresh   # 動作確認のため即時1回実行
-   ```
-   状態は `launchctl print gui/$(id -u)/com.usage-statusline.refresh`、ログは `/tmp/usage-refresh.log` で確認できます。解除するには `launchctl bootout gui/$(id -u)/com.usage-statusline.refresh`。
-
-Claude OAuth 使用量エンドポイントには、リクエスト回数のレート制限もあります（プランの枠とは別で、トークンは消費しません）。5分間隔なら十分に余裕がありますが、短時間に何度も更新すると、短いクールダウンが過ぎるまで HTTP 429 が返ることがあります。
-
-## 注意事項
-- Claude OAuth エンドポイントと Codex app-server の JSON-RPC メソッドは非公式かつ文書化されていません。いずれかの CLI が更新されると、予告なくこのツールが動作しなくなる可能性があります。
-- Claude の使用量は Pro/Max サブスクリプションを対象とします。Codex の使用量は ChatGPT サブスクリプションに関連付けられたレート制限を対象とします。
-- キャッシュファイル（`*-cache.json`）と `claude-input.sig` にはプランと使用量のデータが含まれます。これらは `.gitignore` によって Git から除外されており、コミットしないでください。
-
-## トラブルシューティング
-### 値が `--` のまま変わらない
-Claude Code と Codex CLI にサインインしていることを確認してください。関連する非公式エンドポイントまたは JSON-RPC レスポンスが変更されている可能性もあります。
-### 色が表示されない
-ターミナルと Claude Code のステータスラインが ANSI カラーエスケープシーケンスを表示できることを確認してください。また、報告された値が数値のパーセンテージであることも確認してください。
-### 値が古い
-どちらのキャッシュも、ステータスラインが実行され、キャッシュが存在しないか期限切れ（5分より古い）であることを検出した後にのみ更新されます。ステータスラインをもう一度表示するか、手動で更新してください:
-```bash
-/absolute/path/to/usage-statusline/refresh.sh codex
-/absolute/path/to/usage-statusline/refresh.sh claude
+**2. バックグラウンド取得（launchd）**: cron ではなく launchd を使う。Claude トークンは TCC 保護下の keychain にあり、GUIセッションで動く per-user LaunchAgent なら Full Disk Access なしで読めるが、cron は読めないため。
+```sh
+cp com.claude-codex-usage.refresh.plist.example ~/Library/LaunchAgents/com.claude-codex-usage.refresh.plist
+# 編集: refresh.sh の絶対パスと、codex/jq/curl が通る PATH を設定
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-codex-usage.refresh.plist
+launchctl enable    gui/$(id -u)/com.claude-codex-usage.refresh
+launchctl kickstart -k gui/$(id -u)/com.claude-codex-usage.refresh
 ```
 
-## ライセンス
-MIT。詳しくは [LICENSE](LICENSE) を参照してください。
+### 注意事項
+- Claude の usage エンドポイントは**トークン枠を消費しない**が、**リクエスト回数の制限（HTTP 429）が別途ある**。5分間隔（1日288回）は問題ないが、デバッグ時の連打で 429 を踏む（数分で解消）。
+- launchd は最小 `PATH`。plist の `PATH` に `codex` の場所を入れること。
+- キャッシュ（`*-cache.json`）は使用量データを含むため git 管理外（コミットしない）。
+
+### ライセンス
+[MIT](LICENSE)

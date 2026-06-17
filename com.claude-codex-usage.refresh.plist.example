@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.usage-statusline.refresh</string>
+    <string>com.claude-codex-usage.refresh</string>
 
     <!-- Replace with the absolute path where you cloned this repository. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/absolute/path/to/usage-statusline/refresh.sh</string>
+        <string>/absolute/path/to/claude-codex-usage/refresh.sh</string>
         <string>all</string>
     </array>
 
