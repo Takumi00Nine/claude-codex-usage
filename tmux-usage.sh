@@ -14,6 +14,20 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 now="$(date +%s)"
 CELLS=8   # gauge width in characters
 
+# Responsive: drop the gauge bars (keep labels, %, and reset countdown) when the
+# terminal is too narrow to fit the full segment, so it degrades gracefully
+# instead of being truncated/clipped by tmux. Threshold is overridable.
+#
+# Width comes from $1: tmux.conf passes the client width so the value is resolved
+# in the rendering client's context — e.g. status-right "#(.../tmux-usage.sh #{client_width})".
+# Calling `tmux display-message` from inside #() is unreliable: #() runs as a
+# client-independent async job, so its client_width target is ambiguous.
+NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
+width="${1:-}"
+[[ "$width" =~ ^[0-9]+$ ]] || width="$(tmux display-message -p '#{client_width}' 2>/dev/null)"
+[[ "$width" =~ ^[0-9]+$ ]] || width=999   # unknown width -> assume wide
+if (( width < NARROW_BELOW )); then SHOW_GAUGE=0; else SHOW_GAUGE=1; fi
+
 # Color by utilization: <50 green, 50-80 orange, >=80 red.
 pcolor() {
   local p="${1%.*}"
@@ -25,10 +39,19 @@ pcolor() {
 }
 
 # meter LABEL PERCENT  ->  "LABEL ████░░░░ NN%" (filled colored by level, empty dim)
+# When SHOW_GAUGE=0 (narrow terminal) the gauge bars are dropped: "LABEL NN%".
 meter() {
   local label="$1" p="${2%.*}"
   if [[ -z "$p" ]]; then
-    printf '#[fg=colour252]%s #[fg=colour238]░░░░░░░░ #[fg=colour244]--' "$label"
+    if (( SHOW_GAUGE )); then
+      printf '#[fg=colour252]%s #[fg=colour238]░░░░░░░░ #[fg=colour244]--' "$label"
+    else
+      printf '#[fg=colour252]%s #[fg=colour244]--' "$label"
+    fi
+    return
+  fi
+  if (( ! SHOW_GAUGE )); then
+    printf '#[fg=colour252]%s #[fg=%s]%s%%' "$label" "$(pcolor "$p")" "$p"
     return
   fi
   local filled=$(( (p * CELLS + 50) / 100 )) empty i f="" e=""
@@ -59,6 +82,11 @@ reset_remaining() {
   [[ "$re" =~ ^[0-9]+$ ]] || return
   local rem=$(( re - now ))
   (( rem <= 0 )) && return
+  # Narrow terminal: show total minutes only (e.g. ↻137m) to save width.
+  if (( ! SHOW_GAUGE )); then
+    printf '#[fg=colour244] ↻%dm' $(( rem / 60 ))
+    return
+  fi
   if (( rem < 86400 )); then
     printf '#[fg=colour244] ↻%d:%02d:%02d' $(( rem / 3600 )) $(( (rem % 3600) / 60 )) $(( rem % 60 ))
   else
