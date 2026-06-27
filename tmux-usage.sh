@@ -1,132 +1,147 @@
-#!/usr/bin/env bash
-# tmux status segment: Claude + Codex plan usage, read from the local caches
-# written by refresh.sh (kept fresh by the launchd agent). Pure read — never
-# hits the network, so it is cheap to call every few seconds from tmux.
-#
-# Renders a colored gauge per metric:
-#   CL 5h ███░░░░░ 19%  7d ███░░░░░ 37% │ CX 5h ░░░░░░░░ 1%  7d ░░░░░░░░ 4%
-#
-# Usage in ~/.tmux.conf:
-#   set -g status-right "#(/path/to/usage-statusline/tmux-usage.sh) ..."
-set -uo pipefail
+#!/bin/bash
 
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-now="$(date +%s)"
-CELLS=8   # gauge width in characters
+# Render a tmux status segment from cache files only.
 
-# Responsive: drop the gauge bars (keep labels, %, and reset countdown) when the
-# terminal is too narrow to fit the full segment, so it degrades gracefully
-# instead of being truncated/clipped by tmux. Threshold is overridable.
-#
-# Width comes from $1: tmux.conf passes the client width so the value is resolved
-# in the rendering client's context — e.g. status-right "#(.../tmux-usage.sh #{client_width})".
-# Calling `tmux display-message` from inside #() is unreliable: #() runs as a
-# client-independent async job, so its client_width target is ambiguous.
-NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
-width="${1:-}"
-[[ "$width" =~ ^[0-9]+$ ]] || width="$(tmux display-message -p '#{client_width}' 2>/dev/null)"
-[[ "$width" =~ ^[0-9]+$ ]] || width=999   # unknown width -> assume wide
-if (( width < NARROW_BELOW )); then SHOW_GAUGE=0; else SHOW_GAUGE=1; fi
+load_config() {
+  USAGE_NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
+  CELLS="${CELLS:-8}"
+  STALE_MINUTES="${STALE_MINUTES:-10}"
+  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-codex-usage"
+  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
+  CONFIG_FILE="$CONFIG_DIR/config.sh"
+  if [ -f "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+  fi
+  CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
+  CODEX_CACHE="$CACHE_DIR/codex-cache.json"
+}
 
-# Color by utilization: <50 green, 50-80 orange, >=80 red.
+is_number() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 pcolor() {
-  local p="${1%.*}"
-  [[ -z "$p" ]] && { printf 'colour244'; return; }
-  if   (( p >= 80 )); then printf 'colour197'
-  elif (( p >= 50 )); then printf 'colour214'
-  else                     printf 'colour114'
+  p="${1%.*}"
+  is_number "$p" || { printf '%s' 'colour244'; return; }
+  if [ "$p" -ge 80 ]; then
+    printf '%s' 'colour197'
+  elif [ "$p" -ge 50 ]; then
+    printf '%s' 'colour214'
+  else
+    printf '%s' 'colour114'
   fi
 }
 
-# meter LABEL PERCENT  ->  "LABEL ████░░░░ NN%" (filled colored by level, empty dim)
-# When SHOW_GAUGE=0 (narrow terminal) the gauge bars are dropped: "LABEL NN%".
 meter() {
-  local label="$1" p="${2%.*}"
-  if [[ -z "$p" ]]; then
-    if (( SHOW_GAUGE )); then
-      printf '#[fg=colour252]%s #[fg=colour238]░░░░░░░░ #[fg=colour244]--' "$label"
+  label="$1"
+  value="$2"
+  p="${value%.*}"
+  if ! is_number "$p"; then
+    if [ "$SHOW_GAUGE" -eq 1 ]; then
+      printf '#[fg=colour252]%s #[fg=colour238]' "$label"
+      i=0
+      while [ "$i" -lt "$CELLS" ]; do printf '░'; i=$(( i + 1 )); done
+      printf ' #[fg=colour244]--'
     else
       printf '#[fg=colour252]%s #[fg=colour244]--' "$label"
     fi
     return
   fi
-  if (( ! SHOW_GAUGE )); then
-    printf '#[fg=colour252]%s #[fg=%s]%s%%' "$label" "$(pcolor "$p")" "$p"
+  [ "$p" -gt 100 ] && p=100
+  [ "$p" -lt 0 ] && p=0
+  color="$(pcolor "$p")"
+  if [ "$SHOW_GAUGE" -eq 0 ]; then
+    printf '#[fg=colour252]%s #[fg=%s]%s%%' "$label" "$color" "$p"
     return
   fi
-  local filled=$(( (p * CELLS + 50) / 100 )) empty i f="" e=""
-  (( filled > CELLS )) && filled=$CELLS
-  (( filled < 0 ))     && filled=0
+  filled=$(( (p * CELLS + 50) / 100 ))
+  [ "$filled" -gt "$CELLS" ] && filled="$CELLS"
   empty=$(( CELLS - filled ))
-  for (( i = 0; i < filled; i++ )); do f+="█"; done
-  for (( i = 0; i < empty;  i++ )); do e+="░"; done
-  printf '#[fg=colour252]%s #[fg=%s]%s#[fg=colour238]%s #[fg=%s]%s%%' \
-    "$label" "$(pcolor "$p")" "$f" "$e" "$(pcolor "$p")" "$p"
+  printf '#[fg=colour252]%s #[fg=%s]' "$label" "$color"
+  i=0
+  while [ "$i" -lt "$filled" ]; do printf '█'; i=$(( i + 1 )); done
+  printf '#[fg=colour238]'
+  i=0
+  while [ "$i" -lt "$empty" ]; do printf '░'; i=$(( i + 1 )); done
+  printf ' #[fg=%s]%s%%' "$color" "$p"
 }
 
-# reset_remaining KIND VALUE  ->  "↻3h37m" (time until the 5h window resets, with minutes).
-# KIND is "iso" (Claude, e.g. 2026-06-17T16:09:59+00:00) or "epoch" (Codex, unix seconds).
 reset_remaining() {
-  local kind="$1" val="$2" re=""
-  case "$kind" in
-    iso)
-      [[ -n "$val" && "$val" != "null" ]] || return
-      local norm
-      norm="$(printf '%s' "$val" | sed -E 's/\.[0-9]+([+-][0-9]{2}:[0-9]{2}|Z)$/\1/; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/' 2>/dev/null)"
-      re="$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "$norm" '+%s' 2>/dev/null)"
-      ;;
-    epoch)
-      [[ "$val" =~ ^[0-9]+$ ]] && re="$val"
-      ;;
-  esac
-  [[ "$re" =~ ^[0-9]+$ ]] || return
-  local rem=$(( re - now ))
-  (( rem <= 0 )) && return
-  # Narrow terminal: show total minutes only (e.g. ↻137m) to save width.
-  if (( ! SHOW_GAUGE )); then
+  epoch="$1"
+  is_number "$epoch" || return 0
+  rem=$(( epoch - NOW ))
+  [ "$rem" -gt 0 ] || return 0
+  if [ "$SHOW_GAUGE" -eq 0 ]; then
     printf '#[fg=colour244] ↻%dm' $(( rem / 60 ))
+  else
+    printf '#[fg=colour244] ↻%d:%02d:%02d' $(( rem / 3600 )) $(( (rem % 3600) / 60 )) $(( rem % 60 ))
+  fi
+}
+
+age_suffix() {
+  fetched="$1"
+  is_number "$fetched" || return 0
+  age=$(( NOW - fetched ))
+  limit=$(( STALE_MINUTES * 60 ))
+  if [ "$age" -gt "$limit" ]; then
+    printf ' #[fg=colour244](%d分前)' $(( age / 60 ))
+  fi
+}
+
+read_field() {
+  file="$1"
+  expr="$2"
+  jq -r "$expr // empty" "$file" 2>/dev/null
+}
+
+service_segment() {
+  service="$1"
+  file="$2"
+  label="$3"
+  color="$4"
+  if [ ! -f "$file" ]; then
+    printf '#[fg=colour244]%s n/a' "$label"
     return
   fi
-  if (( rem < 86400 )); then
-    printf '#[fg=colour244] ↻%d:%02d:%02d' $(( rem / 3600 )) $(( (rem % 3600) / 60 )) $(( rem % 60 ))
-  else
-    printf '#[fg=colour244] ↻%dd %d:%02d:%02d' $(( rem / 86400 )) $(( (rem % 86400) / 3600 )) $(( (rem % 3600) / 60 )) $(( rem % 60 ))
+  if ! jq -e . "$file" >/dev/null 2>&1; then
+    printf '#[fg=%s,bold]%s#[nobold] #[fg=colour197]ERR' "$color" "$label"
+    return
   fi
+  h="$(read_field "$file" '.five_hour.used_percent')"
+  d="$(read_field "$file" '.seven_day.used_percent')"
+  r="$(read_field "$file" '.five_hour.resets_at_epoch')"
+  fetched="$(read_field "$file" '.fetched_at')"
+  err="$(read_field "$file" '.last_error.type')"
+  printf '#[fg=%s,bold]%s#[nobold] ' "$color" "$label"
+  meter "5h" "$h"
+  reset_remaining "$r"
+  printf '  '
+  meter "7d" "$d"
+  [ -n "$err" ] && printf ' #[fg=colour197]ERR'
+  age_suffix "$fetched"
 }
 
-# If the cache is older than 10 min, show its age so a frozen/stale value is obvious.
-age_suffix() {
-  local fa="${1:-0}"
-  [[ "$fa" =~ ^[0-9]+$ ]] || return
-  (( fa == 0 )) && return
-  local age=$(( now - fa ))
-  (( age > 600 )) && printf ' #[fg=colour244](%dm前)' $(( age / 60 ))
+main() {
+  load_config
+  NOW="$(date '+%s')"
+  width="${1:-999}"
+  is_number "$width" || width=999
+  SHOW_GAUGE=1
+  if [ "$width" -lt "$USAGE_NARROW_BELOW" ]; then
+    SHOW_GAUGE=0
+  fi
+  command -v jq >/dev/null 2>&1 || {
+    printf '%s\n' '#[fg=colour197]usage ERR'
+    return 0
+  }
+  service_segment claude "$CLAUDE_CACHE" CL colour39
+  printf ' #[fg=colour240]| #[default]'
+  service_segment codex "$CODEX_CACHE" CX colour213
+  printf '\n'
+  return 0
 }
 
-claude_seg() {
-  local f="$DIR/claude-cache.json" h d fa rst
-  [[ -f "$f" ]] || { printf '#[fg=colour244]CL n/a'; return; }
-  h="$(jq -r '.five_hour.utilization  // empty' "$f" 2>/dev/null)"
-  d="$(jq -r '.seven_day.utilization  // empty' "$f" 2>/dev/null)"
-  rst="$(jq -r '.five_hour.resets_at  // empty' "$f" 2>/dev/null)"
-  fa="$(jq -r '.fetched_at // 0'                "$f" 2>/dev/null)"
-  printf '#[fg=colour39,bold]CL#[nobold] '
-  meter "5h" "$h"; reset_remaining iso "$rst"; printf '  '; meter "7d" "$d"
-  age_suffix "$fa"
-}
-
-codex_seg() {
-  local f="$DIR/codex-cache.json" p s fa rst
-  [[ -f "$f" ]] || { printf '#[fg=colour244]CX n/a'; return; }
-  p="$(jq -r '.rateLimits.primary.usedPercent   // empty' "$f" 2>/dev/null)"
-  s="$(jq -r '.rateLimits.secondary.usedPercent // empty' "$f" 2>/dev/null)"
-  rst="$(jq -r '.rateLimits.primary.resetsAt    // empty' "$f" 2>/dev/null)"
-  fa="$(jq -r '.fetched_at // 0'                       "$f" 2>/dev/null)"
-  printf '#[fg=colour213,bold]CX#[nobold] '
-  meter "5h" "$p"; reset_remaining epoch "$rst"; printf '  '; meter "7d" "$s"
-  age_suffix "$fa"
-}
-
-claude_seg
-printf ' #[fg=colour240]│ #[default]'
-codex_seg
+main "$@"
