@@ -113,6 +113,7 @@ service_segment() {
   h="$(read_field "$file" '.five_hour.used_percent')"
   d="$(read_field "$file" '.seven_day.used_percent')"
   r="$(read_field "$file" '.five_hour.resets_at_epoch')"
+  rd="$(read_field "$file" '.seven_day.resets_at_epoch')"
   fetched="$(read_field "$file" '.fetched_at')"
   err="$(read_field "$file" '.last_error.type')"
   printf '#[fg=%s,bold]%s#[nobold] ' "$color" "$label"
@@ -120,6 +121,7 @@ service_segment() {
   reset_remaining "$r"
   printf '  '
   meter "7d" "$d"
+  reset_remaining "$rd"
   [ -n "$err" ] && printf ' #[fg=colour197]ERR'
   age_suffix "$fetched"
 }
