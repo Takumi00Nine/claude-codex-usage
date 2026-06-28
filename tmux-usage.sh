@@ -3,15 +3,15 @@
 # Render a tmux status segment from cache files only.
 
 load_config() {
-  USAGE_NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
-  CELLS="${CELLS:-8}"
-  STALE_MINUTES="${STALE_MINUTES:-10}"
   CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-codex-usage"
   CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
   CONFIG_FILE="$CONFIG_DIR/config.sh"
   if [ -f "$CONFIG_FILE" ]; then
     . "$CONFIG_FILE"
   fi
+  USAGE_NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
+  CELLS="${CELLS:-8}"
+  STALE_MINUTES="${STALE_MINUTES:-10}"
   CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
   CODEX_CACHE="$CACHE_DIR/codex-cache.json"
 }
