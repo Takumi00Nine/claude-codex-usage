@@ -28,6 +28,10 @@ load_config() {
   NOTIFY_STATE="$CACHE_DIR/notify-state.json"
 }
 
+log() {
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" "$*"
+}
+
 # Global state for codex server cleanup (set by fetch_codex_once, read by trap handler)
 _codex_server_pid=""
 _codex_writer_pid=""
@@ -118,7 +122,7 @@ with_lock() {
       ''|*[!0-9]*) rm -rf "$lock" 2>/dev/null ;;
       *) [ $(( now - created )) -gt "$max_age" ] && rm -rf "$lock" 2>/dev/null ;;
     esac
-    mkdir "$lock" 2>/dev/null || return 0
+    mkdir "$lock" 2>/dev/null || { log "$name: lock held, skipping"; return 0; }
   fi
   printf '%s\n' "$$" >"$lock/pid" 2>/dev/null
   now_epoch >"$lock/created_at" 2>/dev/null
@@ -342,7 +346,12 @@ retry_fetch() {
       fetch_codex_once "$out_file" "$err_file"
     fi
     last_status=$?
-    [ "$last_status" -eq 0 ] && return 0
+    if [ "$last_status" -eq 0 ]; then
+      log "$service: fetch OK (attempt $attempt/$max_attempts)"
+      return 0
+    fi
+    err_detail="$(cat "$err_file" 2>/dev/null | head -1)"
+    log "$service: fetch FAILED status=$last_status attempt=$attempt/$max_attempts${err_detail:+ ($err_detail)}"
     [ "$attempt" -lt "$max_attempts" ] || break
     if [ "$last_status" -eq 42 ]; then
       sleep_seconds=$(( 1 << (attempt - 1) ))
@@ -350,6 +359,7 @@ retry_fetch() {
     else
       sleep_seconds=1
     fi
+    log "$service: retry in ${sleep_seconds}s"
     sleep "$sleep_seconds"
   done
   return "$last_status"
@@ -533,6 +543,7 @@ main() {
     claude|codex|all) ;;
     *) printf '%s\n' "usage: $0 [claude|codex|all]" >&2; return 2 ;;
   esac
+  log "refresh.sh $mode: started"
   command -v jq >/dev/null 2>&1 || { printf '%s\n' 'missing required command: jq' >&2; return 3; }
   command -v curl >/dev/null 2>&1 || { printf '%s\n' 'missing required command: curl' >&2; return 3; }
   if [ "$mode" = "codex" ] || [ "$mode" = "all" ]; then
