@@ -105,6 +105,13 @@ run_with_timeout() {
   return "$status"
 }
 
+is_transient_fetch_status() {
+  case "$1" in
+    42|124|5|6|7|28|52|55|56) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 lock_max_age() {
   printf '%s\n' $(( REQUEST_TIMEOUT * (RETRY_COUNT + 1) + HOOK_TIMEOUT + 30 ))
 }
@@ -352,13 +359,12 @@ retry_fetch() {
     fi
     err_detail="$(cat "$err_file" 2>/dev/null | head -1)"
     log "$service: fetch FAILED status=$last_status attempt=$attempt/$max_attempts${err_detail:+ ($err_detail)}"
-    [ "$attempt" -lt "$max_attempts" ] || break
     if [ "$last_status" -eq 42 ]; then
-      sleep_seconds=$(( 1 << (attempt - 1) ))
-      [ "$sleep_seconds" -gt 30 ] && sleep_seconds=30
-    else
-      sleep_seconds=1
+      log "$service: rate limited; retry suppressed until next refresh cycle"
+      break
     fi
+    [ "$attempt" -lt "$max_attempts" ] || break
+    sleep_seconds=1
     log "$service: retry in ${sleep_seconds}s"
     sleep "$sleep_seconds"
   done
@@ -517,6 +523,11 @@ refresh_service() {
     }
     rm -f "$out" "$err" 2>/dev/null
     with_lock notify process_notifications "$service" "$cache"
+    return 0
+  fi
+  if is_transient_fetch_status "$fetch_status"; then
+    log "$service: transient fetch failure; keeping existing cache"
+    rm -f "$out" "$err" 2>/dev/null
     return 0
   fi
   case "$fetch_status" in

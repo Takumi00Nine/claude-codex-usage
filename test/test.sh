@@ -75,6 +75,76 @@ test_failure_update() {
   assert_eq "failure keeps fetched_at" "100" "$(jq -r '.fetched_at' "$CLAUDE_CACHE")"
 }
 
+test_transient_refresh_failures() {
+  export XDG_CACHE_HOME="$tmp/transient-cache"
+  CACHE_DIR="$XDG_CACHE_HOME/claude-codex-usage"
+  LOCK_DIR="$CACHE_DIR/locks"
+  TMP_DIR="$CACHE_DIR/tmp"
+  CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
+  NOTIFY_STATE="$CACHE_DIR/notify-state.json"
+  mkdir -p "$CACHE_DIR" "$LOCK_DIR" "$TMP_DIR"
+  RETRY_COUNT=2
+  old='{"schema_version":1,"service":"claude","fetched_at":100,"updated_at":100,"five_hour":{"used_percent":55,"resets_at":null,"resets_at_epoch":null},"seven_day":{"used_percent":10,"resets_at":null,"resets_at_epoch":null},"last_error":null}'
+  printf '%s\n' "$old" >"$CLAUDE_CACHE"
+
+  MOCK_ATTEMPTS_FILE="$tmp/mock-attempts.log"
+  MOCK_STATUS=42
+  MOCK_DETAIL=429
+  fetch_claude_once() {
+    out_file="$1"
+    err_file="$2"
+    printf '%s\n' attempt >>"$MOCK_ATTEMPTS_FILE"
+    printf '%s\n' "$MOCK_DETAIL" >"$err_file"
+    : >"$out_file"
+    return "$MOCK_STATUS"
+  }
+
+  : >"$MOCK_ATTEMPTS_FILE"
+  refresh_service claude >/dev/null 2>&1
+  assert_eq "429 keeps last_error null" "null" "$(jq -r '.last_error' "$CLAUDE_CACHE")"
+  assert_eq "429 keeps fetched_at" "100" "$(jq -r '.fetched_at' "$CLAUDE_CACHE")"
+  assert_eq "429 suppresses retry" "1" "$(wc -l <"$MOCK_ATTEMPTS_FILE" | tr -d ' ')"
+  out="$("$ROOT/tmux-usage.sh" 120)"
+  case "$out" in
+    *ERR*) not_ok "429 tmux omits ERR" ;;
+    *) ok "429 tmux omits ERR" ;;
+  esac
+
+  MOCK_STATUS=28
+  MOCK_DETAIL="operation timed out"
+  : >"$MOCK_ATTEMPTS_FILE"
+  refresh_service claude >/dev/null 2>&1
+  assert_eq "timeout keeps last_error null" "null" "$(jq -r '.last_error' "$CLAUDE_CACHE")"
+  assert_eq "timeout keeps usage" "55" "$(jq -r '.five_hour.used_percent' "$CLAUDE_CACHE")"
+}
+
+test_non_transient_refresh_failure() {
+  export XDG_CACHE_HOME="$tmp/non-transient-cache"
+  CACHE_DIR="$XDG_CACHE_HOME/claude-codex-usage"
+  LOCK_DIR="$CACHE_DIR/locks"
+  TMP_DIR="$CACHE_DIR/tmp"
+  CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
+  NOTIFY_STATE="$CACHE_DIR/notify-state.json"
+  mkdir -p "$CACHE_DIR" "$LOCK_DIR" "$TMP_DIR"
+  RETRY_COUNT=2
+  old='{"schema_version":1,"service":"claude","fetched_at":200,"updated_at":200,"five_hour":{"used_percent":60,"resets_at":null,"resets_at_epoch":null},"seven_day":{"used_percent":20,"resets_at":null,"resets_at_epoch":null},"last_error":null}'
+  printf '%s\n' "$old" >"$CLAUDE_CACHE"
+
+  fetch_claude_once() {
+    out_file="$1"
+    err_file="$2"
+    printf '%s\n' 401 >"$err_file"
+    : >"$out_file"
+    return 12
+  }
+
+  refresh_service claude >/dev/null 2>&1
+  assert_eq "401 writes error type" "http" "$(jq -r '.last_error.type' "$CLAUDE_CACHE")"
+  assert_eq "401 writes status" "401" "$(jq -r '.last_error.status' "$CLAUDE_CACHE")"
+  out="$("$ROOT/tmux-usage.sh" 120)"
+  assert_contains "401 tmux shows ERR" "$out" "ERR"
+}
+
 test_notifications() {
   CACHE_DIR="$tmp/cache/claude-codex-usage"
   NOTIFY_STATE="$CACHE_DIR/notify-state.json"
@@ -156,6 +226,8 @@ test_syntax() {
 
 test_json_transform
 test_failure_update
+test_transient_refresh_failures
+test_non_transient_refresh_failure
 test_notifications
 test_tmux_display
 test_plist_generation
