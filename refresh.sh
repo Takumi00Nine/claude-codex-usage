@@ -20,7 +20,7 @@ load_config() {
   NOTIFY_SOUND="${NOTIFY_SOUND:-Ping}"
   RESET_HOOK="${RESET_HOOK:-}"
   HOOK_TIMEOUT="${HOOK_TIMEOUT:-60}"
-  SLEEP_STALE_MINUTES="${SLEEP_STALE_MINUTES:-5}"
+  validate_config_numbers
   LOCK_DIR="$CACHE_DIR/locks"
   TMP_DIR="$CACHE_DIR/tmp"
   CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
@@ -32,10 +32,53 @@ log() {
   printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" "$*"
 }
 
+is_unsigned_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+config_fallback() {
+  local name default reason
+  name="$1"
+  default="$2"
+  reason="$3"
+  log "config: $name invalid ($reason); using default $default"
+  eval "$name=\$default"
+}
+
+normalize_int_config() {
+  local name default min max value
+  name="$1"
+  default="$2"
+  min="$3"
+  max="$4"
+  eval "value=\"\${$name}\""
+  is_unsigned_int "$value" || { config_fallback "$name" "$default" "not an integer"; return; }
+  [ "$value" -ge "$min" ] || { config_fallback "$name" "$default" "below $min"; return; }
+  if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+    config_fallback "$name" "$default" "above $max"
+  fi
+}
+
+validate_config_numbers() {
+  normalize_int_config REFRESH_INTERVAL 60 1 ""
+  normalize_int_config REQUEST_TIMEOUT 15 1 ""
+  normalize_int_config RETRY_COUNT 2 0 ""
+  normalize_int_config WARN_THRESHOLD 80 0 100
+  normalize_int_config NOTIFY_THRESHOLD 20 0 100
+  normalize_int_config NOTIFY_FLOOR 5 0 100
+  normalize_int_config HOOK_TIMEOUT 60 1 ""
+}
+
 # Global state for codex server cleanup (set by fetch_codex_once, read by trap handler)
 _codex_server_pid=""
 _codex_writer_pid=""
 _codex_tmp_dir=""
+
+# Global state for lock cleanup (set by with_lock, read by trap handler)
+_held_locks=""
 
 cleanup_codex_server() {
   [ -n "$_codex_writer_pid" ] && kill "$_codex_writer_pid" 2>/dev/null
@@ -44,11 +87,20 @@ cleanup_codex_server() {
   [ -n "$_codex_tmp_dir" ]    && rm -rf "$_codex_tmp_dir" 2>/dev/null
 }
 
+cleanup_locks() {
+  local lock
+  printf '%s\n' "$_held_locks" | while IFS= read lock; do
+    [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+  done
+  _held_locks=""
+}
+
 now_epoch() {
   date -u '+%s'
 }
 
 iso_to_epoch() {
+  local value normalized
   value="$1"
   [ -n "$value" ] && [ "$value" != "null" ] || return 1
   normalized="$(printf '%s' "$value" | sed -E 's/\.[0-9]+([+-][0-9]{2}:[0-9]{2}|Z)$/\1/; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/' 2>/dev/null)"
@@ -113,6 +165,7 @@ is_transient_fetch_status() {
 }
 
 safe_error_token() {
+  local value
   value="$(cat "$1" 2>/dev/null | tail -n 1)"
   case "$value" in
     http_status=[0-9][0-9][0-9]) printf '%s' "$value"; return 0 ;;
@@ -131,6 +184,7 @@ lock_max_age() {
 }
 
 with_lock() {
+  local name lock created now max_age status previous_held_locks
   name="$1"
   shift
   mkdir -p "$LOCK_DIR" "$TMP_DIR" 2>/dev/null || return 1
@@ -147,13 +201,22 @@ with_lock() {
   fi
   printf '%s\n' "$$" >"$lock/pid" 2>/dev/null
   now_epoch >"$lock/created_at" 2>/dev/null
+  previous_held_locks="$_held_locks"
+  if [ -n "$_held_locks" ]; then
+    _held_locks="$_held_locks
+$lock"
+  else
+    _held_locks="$lock"
+  fi
   "$@"
   status=$?
   rm -rf "$lock" 2>/dev/null
+  _held_locks="$previous_held_locks"
   return "$status"
 }
 
 empty_error_cache() {
+  local service now type message status attempts
   service="$1"
   now="$2"
   type="$3"
@@ -200,6 +263,7 @@ write_failure_cache() {
 }
 
 transform_claude_usage() {
+  local raw now fh_reset sd_reset fh_epoch sd_epoch value
   raw="$1"
   now="$2"
   fh_reset="$(printf '%s' "$raw" | jq -r '.five_hour.resets_at // .five_hour.resetsAt // empty' 2>/dev/null)"
@@ -236,6 +300,7 @@ transform_claude_usage() {
 }
 
 transform_codex_usage() {
+  local raw now
   raw="$1"
   now="$2"
   printf '%s' "$raw" | jq -c --argjson now "$now" '
@@ -258,6 +323,7 @@ transform_codex_usage() {
 }
 
 validate_usage_payload() {
+  local service payload
   service="$1"
   payload="$2"
   printf '%s' "$payload" | jq -e --arg service "$service" '
@@ -269,6 +335,7 @@ validate_usage_payload() {
 }
 
 write_validated_usage_payload() {
+  local service payload out_file err_file
   service="$1"
   payload="$2"
   out_file="$3"
@@ -281,6 +348,7 @@ write_validated_usage_payload() {
 }
 
 fetch_claude_once() {
+  local out_file err_file token response curl_status status body now transformed
   out_file="$1"
   err_file="$2"
   token="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null \
@@ -321,6 +389,7 @@ fetch_claude_once() {
 }
 
 fetch_codex_once() {
+  local out_file err_file in_fifo server_out server_err codex_deadline start_seconds result now transformed
   out_file="$1"
   err_file="$2"
   _codex_tmp_dir="$TMP_DIR/codex.$$.$RANDOM"
@@ -387,6 +456,7 @@ fetch_codex_once() {
 }
 
 retry_fetch() {
+  local service out_file err_file attempt max_attempts last_status err_detail sleep_seconds
   service="$1"
   out_file="$2"
   err_file="$3"
@@ -445,6 +515,7 @@ read_notify_state() {
 }
 
 send_notification() {
+  local message
   message="$1"
   if [ -n "${CLAUDE_CODEX_USAGE_TEST_NOTIFY_LOG:-}" ]; then
     printf '%s\n' "$message" >>"$CLAUDE_CODEX_USAGE_TEST_NOTIFY_LOG"
@@ -459,6 +530,7 @@ send_notification() {
 }
 
 run_reset_hook() {
+  local service window prev current
   service="$1"
   window="$2"
   prev="$3"
@@ -470,6 +542,7 @@ run_reset_hook() {
 }
 
 process_notifications() {
+  local service cache state now cache_json events kind window a b display_service display_window updated
   service="$1"
   cache="$2"
   [ -f "$cache" ] || return 0
@@ -551,6 +624,7 @@ process_notifications() {
 }
 
 refresh_service() {
+  local service cache out err fetch_status attempts payload error_type message status_json
   service="$1"
   if [ "$service" = "claude" ]; then
     cache="$CLAUDE_CACHE"
@@ -594,9 +668,10 @@ refresh_service() {
 
 main() {
   load_config
-  trap 'cleanup_codex_server; exit 130' INT
-  trap 'cleanup_codex_server; exit 143' TERM
-  trap 'cleanup_codex_server'           EXIT
+  local mode
+  trap 'cleanup_locks; cleanup_codex_server; exit 130' INT
+  trap 'cleanup_locks; cleanup_codex_server; exit 143' TERM
+  trap 'cleanup_locks; cleanup_codex_server'           EXIT
   mode="${1:-all}"
   case "$mode" in
     claude|codex|all) ;;

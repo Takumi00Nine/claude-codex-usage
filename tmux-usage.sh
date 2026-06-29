@@ -12,8 +12,13 @@ load_config() {
   USAGE_NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
   CELLS="${CELLS:-8}"
   STALE_MINUTES="${STALE_MINUTES:-10}"
+  validate_config_numbers
   CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
   CODEX_CACHE="$CACHE_DIR/codex-cache.json"
+}
+
+config_log() {
+  printf '%s\n' "$*" >&2
 }
 
 is_number() {
@@ -23,7 +28,37 @@ is_number() {
   esac
 }
 
+config_fallback() {
+  local name default reason
+  name="$1"
+  default="$2"
+  reason="$3"
+  config_log "config: $name invalid ($reason); using default $default"
+  eval "$name=\$default"
+}
+
+normalize_int_config() {
+  local name default min max value
+  name="$1"
+  default="$2"
+  min="$3"
+  max="$4"
+  eval "value=\"\${$name}\""
+  is_number "$value" || { config_fallback "$name" "$default" "not an integer"; return; }
+  [ "$value" -ge "$min" ] || { config_fallback "$name" "$default" "below $min"; return; }
+  if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+    config_fallback "$name" "$default" "above $max"
+  fi
+}
+
+validate_config_numbers() {
+  normalize_int_config USAGE_NARROW_BELOW 100 1 ""
+  normalize_int_config CELLS 8 1 ""
+  normalize_int_config STALE_MINUTES 10 1 ""
+}
+
 pcolor() {
+  local p
   p="${1%.*}"
   is_number "$p" || { printf '%s' 'colour244'; return; }
   if [ "$p" -ge 80 ]; then
@@ -36,6 +71,7 @@ pcolor() {
 }
 
 meter() {
+  local label value p color filled empty i
   label="$1"
   value="$2"
   p="${value%.*}"
@@ -70,6 +106,7 @@ meter() {
 }
 
 reset_remaining() {
+  local epoch rem
   epoch="$1"
   is_number "$epoch" || return 0
   rem=$(( epoch - NOW ))
@@ -82,6 +119,7 @@ reset_remaining() {
 }
 
 age_suffix() {
+  local fetched age limit
   fetched="$1"
   is_number "$fetched" || return 0
   age=$(( NOW - fetched ))
@@ -92,12 +130,14 @@ age_suffix() {
 }
 
 read_field() {
+  local file expr
   file="$1"
   expr="$2"
   jq -r "$expr // empty" "$file" 2>/dev/null
 }
 
 service_segment() {
+  local service file label color h d r rd fetched err
   service="$1"
   file="$2"
   label="$3"
@@ -128,6 +168,7 @@ service_segment() {
 
 main() {
   load_config
+  local width NOW SHOW_GAUGE
   NOW="$(date '+%s')"
   width="${1:-999}"
   is_number "$width" || width=999

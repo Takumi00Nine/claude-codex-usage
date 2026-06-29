@@ -303,7 +303,6 @@ refresh.sh all
 | `NOTIFY_SOUND` | `Ping` | `osascript` 通知サウンド |
 | `RESET_HOOK` | 空 | リセット通知後に呼ぶ外部スクリプト |
 | `HOOK_TIMEOUT` | `60` | `RESET_HOOK` 実行のタイムアウト秒 |
-| `SLEEP_STALE_MINUTES` | `5` | スリープ復帰相当の stale 判定 |
 | `XDG_CONFIG_HOME` | `$HOME/.config` | 設定ディレクトリ上書き |
 | `XDG_CACHE_HOME` | `$HOME/.cache` | キャッシュディレクトリ上書き |
 
@@ -429,7 +428,7 @@ uninstall.sh --purge-cache
 
 1. `launchctl bootout gui/$(id -u)/com.claude-codex-usage.refresh` を試行。
 2. `~/Library/LaunchAgents/com.claude-codex-usage.refresh.plist` を削除。
-3. `--purge-cache` 指定時のみ `~/.cache/claude-codex-usage/` を削除。
+3. `--purge-cache` 指定時のみ `~/.cache/claude-codex-usage/` を削除する。削除前に対象パスを表示し、空文字・`/`・`$HOME`・`$HOME` 直下の浅いパス・末尾が `claude-codex-usage` でないパスは拒否する。
 4. `~/.config/claude-codex-usage/config.sh` は削除しない。
 
 終了コード:
@@ -491,7 +490,7 @@ uninstall.sh --purge-cache
 - `RunAtLoad` でロード直後に1回取得する。
 - `StartCalendarInterval` でカレンダー時刻に起動する。
 - macOS のスリープ中に逃したカレンダー実行は復帰後にまとめて扱われるため、復帰直後の `refresh.sh all` 起動を期待できる。
-- 念のため `refresh.sh` は起動時に `fetched_at` を見て `SLEEP_STALE_MINUTES` 超なら通常取得を行う。通常の1分起動でも同じコードパスを使う。
+- `refresh.sh` は起動のたびに通常取得を行う単一エントリポイントである。launchd の wake coalesce 発火と合わせて、別閾値なしでスリープ復帰後の即時更新要件を満たす。旧 `SLEEP_STALE_MINUTES` は廃止済み。
 - `StartInterval` は使わない。要件の coalesce 方針を優先する。
 
 ## 6. タイムアウト・リトライ実装方針
@@ -789,7 +788,7 @@ done
 
 ### 8.3 タイムアウト時の掃除
 
-`cleanup_codex_server` 関数がグローバル変数を参照する。`trap` で `main` の先頭に登録し、シグナル受信時でもプロセスリークしない。
+`cleanup_codex_server` と `cleanup_locks` 関数がグローバル変数を参照する。`trap` で `main` の先頭に登録し、シグナル受信時でもプロセスリークとロック残存を防ぐ。
 
 ```bash
 cleanup_codex_server() {
@@ -799,10 +798,18 @@ cleanup_codex_server() {
   [ -n "$_codex_tmp_dir" ]    && rm -rf "$_codex_tmp_dir" 2>/dev/null
 }
 
+cleanup_locks() {
+  local lock
+  printf '%s\n' "$_held_locks" | while IFS= read lock; do
+    [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+  done
+  _held_locks=""
+}
+
 # main() の先頭で登録する
-trap 'cleanup_codex_server; exit 130' INT    # Ctrl+C (128+2)
-trap 'cleanup_codex_server; exit 143' TERM   # kill (128+15)
-trap 'cleanup_codex_server'           EXIT   # 通常終了・上記シグナル後の共通後処理
+trap 'cleanup_locks; cleanup_codex_server; exit 130' INT    # Ctrl+C (128+2)
+trap 'cleanup_locks; cleanup_codex_server; exit 143' TERM   # kill (128+15)
+trap 'cleanup_locks; cleanup_codex_server'           EXIT   # 通常終了・上記シグナル後の共通後処理
 ```
 
 `codex app-server` が SIGTERM を無視した場合は `kill -9` にフォールバックする。

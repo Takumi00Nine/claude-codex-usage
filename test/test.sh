@@ -60,6 +60,83 @@ export CLAUDE_CODEX_USAGE_TEST_LIB=1
 . "$ROOT/install.sh"
 unset CLAUDE_CODEX_USAGE_TEST_LIB
 
+test_lock_cleanup_trap() {
+  lock_cache="$tmp/lock-cleanup-cache"
+  mkdir -p "$lock_cache"
+  /bin/bash -c '
+    export CLAUDE_CODEX_USAGE_TEST_LIB=1
+    export XDG_CACHE_HOME="$1"
+    . "$2/refresh.sh"
+    trap '"'"'cleanup_locks; cleanup_codex_server; exit 143'"'"' TERM
+    hold_and_signal() {
+      kill -TERM $$
+      sleep 5
+    }
+    nested_lock() {
+      with_lock trap-test-inner hold_and_signal
+    }
+    with_lock trap-test nested_lock
+  ' _ "$lock_cache" "$ROOT" >/dev/null 2>&1
+  status=$?
+  assert_eq "lock trap exits with TERM status" "143" "$status"
+  if [ -d "$lock_cache/claude-codex-usage/locks/trap-test.lock.d" ]; then
+    not_ok "lock trap cleanup removes held lock"
+  else
+    ok "lock trap cleanup removes held lock"
+  fi
+  if [ -d "$lock_cache/claude-codex-usage/locks/trap-test-inner.lock.d" ]; then
+    not_ok "lock trap cleanup removes nested held lock"
+  else
+    ok "lock trap cleanup removes nested held lock"
+  fi
+}
+
+test_invalid_numeric_config_fallback() {
+  cfg_home="$tmp/numeric-config"
+  cache_home="$tmp/numeric-cache"
+  mkdir -p "$cfg_home/claude-codex-usage" "$cache_home"
+  {
+    printf '%s\n' 'REQUEST_TIMEOUT=abc'
+    printf '%s\n' 'RETRY_COUNT=-1'
+    printf '%s\n' 'WARN_THRESHOLD=101'
+    printf '%s\n' 'HOOK_TIMEOUT=0'
+  } >"$cfg_home/claude-codex-usage/config.sh"
+  out="$(XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" CLAUDE_CODEX_USAGE_TEST_LIB=1 /bin/bash -c '. "$1/refresh.sh"; printf "%s,%s,%s,%s\n" "$REQUEST_TIMEOUT" "$RETRY_COUNT" "$WARN_THRESHOLD" "$HOOK_TIMEOUT"' _ "$ROOT" 2>/dev/null | tail -n 1)"
+  assert_eq "refresh invalid numeric config falls back" "15,2,80,60" "$out"
+
+  cfg_home="$tmp/tmux-numeric-config"
+  cache_home="$tmp/tmux-numeric-cache"
+  mkdir -p "$cfg_home/claude-codex-usage" "$cache_home/claude-codex-usage"
+  {
+    printf '%s\n' 'CELLS=-4'
+    printf '%s\n' 'STALE_MINUTES=nope'
+    printf '%s\n' 'USAGE_NARROW_BELOW=wide'
+  } >"$cfg_home/claude-codex-usage/config.sh"
+  now="$(date '+%s')"
+  jq -cn --argjson now "$now" '{schema_version:1,service:"claude",fetched_at:$now,updated_at:$now,five_hour:{used_percent:50,resets_at_epoch:null},seven_day:{used_percent:10,resets_at_epoch:null},last_error:null}' >"$cache_home/claude-codex-usage/claude-cache.json"
+  out="$(XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/tmux-usage.sh" 120 2>/dev/null)"
+  assert_contains "tmux invalid numeric config still renders" "$out" "50%"
+}
+
+test_uninstall_purge_cache_guard() {
+  home_dir="$tmp/uninstall-home"
+  cfg_home="$tmp/uninstall-config"
+  cache_home="$tmp/uninstall-cache"
+  mkdir -p "$home_dir/Library/LaunchAgents" "$cfg_home/claude-codex-usage" "$cache_home"
+  dangerous="$home_dir/claude-codex-usage"
+  mkdir -p "$dangerous"
+  printf '%s\n' "CACHE_DIR=\"$dangerous\"" >"$cfg_home/claude-codex-usage/config.sh"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  status=$?
+  assert_eq "purge-cache dangerous path rejected status" "2" "$status"
+  assert_contains "purge-cache dangerous path rejected message" "$out" "refusing to purge"
+  if [ -d "$dangerous" ]; then
+    ok "purge-cache leaves dangerous path intact"
+  else
+    not_ok "purge-cache leaves dangerous path intact"
+  fi
+}
+
 test_json_transform() {
   now=1782585600
   claude_raw='{"five_hour":{"utilization":42,"resets_at":"2026-06-28T12:34:56Z"},"seven_day":{"utilization":18,"resets_at":"2026-07-01T00:00:00Z"}}'
@@ -325,6 +402,9 @@ test_syntax() {
   done
 }
 
+test_lock_cleanup_trap
+test_invalid_numeric_config_fallback
+test_uninstall_purge_cache_guard
 test_json_transform
 test_usage_payload_validation
 test_parse_failure_cache

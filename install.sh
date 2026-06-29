@@ -25,19 +25,70 @@ load_config() {
   USAGE_NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
   CELLS="${CELLS:-8}"
   STALE_MINUTES="${STALE_MINUTES:-10}"
-  SLEEP_STALE_MINUTES="${SLEEP_STALE_MINUTES:-5}"
+  validate_config_numbers
 }
 
 xml_escape() {
-  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+  local value
+  value="$1"
+  printf '%s' "$value" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
+
+config_log() {
+  printf '%s\n' "$*" >&2
+}
+
+is_unsigned_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+config_fallback() {
+  local name default reason
+  name="$1"
+  default="$2"
+  reason="$3"
+  config_log "config: $name invalid ($reason); using default $default"
+  eval "$name=\$default"
+}
+
+normalize_int_config() {
+  local name default min max value
+  name="$1"
+  default="$2"
+  min="$3"
+  max="$4"
+  eval "value=\"\${$name}\""
+  is_unsigned_int "$value" || { config_fallback "$name" "$default" "not an integer"; return; }
+  [ "$value" -ge "$min" ] || { config_fallback "$name" "$default" "below $min"; return; }
+  if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+    config_fallback "$name" "$default" "above $max"
+  fi
+}
+
+validate_config_numbers() {
+  normalize_int_config REFRESH_INTERVAL 60 1 ""
+  normalize_int_config REQUEST_TIMEOUT 15 1 ""
+  normalize_int_config RETRY_COUNT 2 0 ""
+  normalize_int_config WARN_THRESHOLD 80 0 100
+  normalize_int_config NOTIFY_THRESHOLD 20 0 100
+  normalize_int_config NOTIFY_FLOOR 5 0 100
+  normalize_int_config HOOK_TIMEOUT 60 1 ""
+  normalize_int_config USAGE_NARROW_BELOW 100 1 ""
+  normalize_int_config CELLS 8 1 ""
+  normalize_int_config STALE_MINUTES 10 1 ""
 }
 
 path_dir() {
+  local command_path
   command_path="$1"
   dirname "$command_path"
 }
 
 append_unique_path() {
+  local item current
   item="$1"
   current="$2"
   case ":$current:" in
@@ -47,6 +98,7 @@ append_unique_path() {
 }
 
 build_path() {
+  local result cmd found dir
   result=""
   for cmd in jq curl codex osascript launchctl; do
     found="$(command -v "$cmd" 2>/dev/null)"
@@ -69,6 +121,7 @@ validate_interval() {
 }
 
 calendar_entries() {
+  local interval step minute
   interval="$1"
   step=$(( interval / 60 ))
   minute=0
@@ -79,6 +132,7 @@ calendar_entries() {
 }
 
 generate_plist() {
+  local refresh_path env_path log_path
   refresh_path="$(xml_escape "$SCRIPT_DIR/refresh.sh")"
   env_path="$(xml_escape "$1")"
   log_path="$(xml_escape "$LOG_DIR/refresh.log")"
@@ -115,6 +169,7 @@ generate_plist() {
 }
 
 write_plist() {
+  local env_path tmp
   env_path="$1"
   tmp="$PLIST_PATH.tmp.$$"
   generate_plist "$env_path" >"$tmp" 2>/dev/null || {
@@ -129,6 +184,7 @@ write_plist() {
 }
 
 check_required() {
+  local missing cmd
   missing=""
   for cmd in jq curl codex osascript launchctl; do
     command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
@@ -141,6 +197,7 @@ check_required() {
 }
 
 main() {
+  local env_path uid
   load_config
   check_required || return 3
   validate_interval || {

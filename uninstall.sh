@@ -13,7 +13,57 @@ load_config() {
   fi
 }
 
+normalize_path_no_trailing_slash() {
+  local path
+  path="$1"
+  while [ "$path" != "/" ]; do
+    case "$path" in
+      */) path="${path%/}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$path"
+}
+
+validate_purge_cache_dir() {
+  local target home rest
+  target="$(normalize_path_no_trailing_slash "$CACHE_DIR")"
+  home="$(normalize_path_no_trailing_slash "$HOME")"
+  case "$target" in
+    ""|"/")
+      printf 'refusing to purge unsafe cache dir: %s\n' "${target:-<empty>}" >&2
+      return 1
+      ;;
+  esac
+  if [ "$target" = "$home" ]; then
+    printf 'refusing to purge unsafe cache dir: %s\n' "$target" >&2
+    return 1
+  fi
+  case "$target" in
+    "$home"/*)
+      rest="${target#$home/}"
+      case "$rest" in
+        */*) ;;
+        *)
+          printf 'refusing to purge shallow HOME path: %s\n' "$target" >&2
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+  case "$target" in
+    */claude-codex-usage) ;;
+    *)
+      printf 'refusing to purge unexpected cache dir: %s\n' "$target" >&2
+      return 1
+      ;;
+  esac
+  CACHE_DIR="$target"
+  return 0
+}
+
 main() {
+  local purge uid
   purge=0
   case "${1:-}" in
     "") ;;
@@ -32,10 +82,17 @@ main() {
     printf 'plist not found: %s\n' "$PLIST_PATH"
   fi
   if [ "$purge" -eq 1 ]; then
+    validate_purge_cache_dir || return 2
+    printf 'purging cache dir: %s\n' "$CACHE_DIR"
     rm -rf "$CACHE_DIR" 2>/dev/null || return 1
     printf 'removed %s\n' "$CACHE_DIR"
   fi
   return 0
 }
 
-main "$@"
+if [ "${CLAUDE_CODEX_USAGE_TEST_LIB:-}" = "1" ]; then
+  load_config
+else
+  main "$@"
+  exit $?
+fi
