@@ -80,11 +80,23 @@ _codex_tmp_dir=""
 # Global state for lock cleanup (set by with_lock, read by trap handler)
 _held_locks=""
 
+# Global state for Claude curl auth config cleanup (set by fetch_claude_once)
+_claude_curl_config_files=""
+_claude_curl_config_file_result=""
+
 cleanup_codex_server() {
   [ -n "$_codex_writer_pid" ] && kill "$_codex_writer_pid" 2>/dev/null
   [ -n "$_codex_server_pid" ] && kill "$_codex_server_pid" 2>/dev/null
   [ -n "$_codex_server_pid" ] && wait "$_codex_server_pid" 2>/dev/null
   [ -n "$_codex_tmp_dir" ]    && rm -rf "$_codex_tmp_dir" 2>/dev/null
+}
+
+cleanup_claude_curl_configs() {
+  local file
+  printf '%s\n' "$_claude_curl_config_files" | while IFS= read file; do
+    [ -n "$file" ] && rm -f "$file" 2>/dev/null
+  done
+  _claude_curl_config_files=""
 }
 
 cleanup_locks() {
@@ -199,8 +211,6 @@ with_lock() {
     esac
     mkdir "$lock" 2>/dev/null || { log "$name: lock held, skipping"; return 0; }
   fi
-  printf '%s\n' "$$" >"$lock/pid" 2>/dev/null
-  now_epoch >"$lock/created_at" 2>/dev/null
   previous_held_locks="$_held_locks"
   if [ -n "$_held_locks" ]; then
     _held_locks="$_held_locks
@@ -208,6 +218,8 @@ $lock"
   else
     _held_locks="$lock"
   fi
+  printf '%s\n' "$$" >"$lock/pid" 2>/dev/null
+  now_epoch >"$lock/created_at" 2>/dev/null
   "$@"
   status=$?
   rm -rf "$lock" 2>/dev/null
@@ -347,8 +359,67 @@ write_validated_usage_payload() {
   printf '%s\n' "$payload" >"$out_file"
 }
 
+curl_config_quote() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+register_claude_curl_config() {
+  local file
+  file="$1"
+  if [ -n "$_claude_curl_config_files" ]; then
+    _claude_curl_config_files="$_claude_curl_config_files
+$file"
+  else
+    _claude_curl_config_files="$file"
+  fi
+}
+
+create_claude_curl_config() {
+  local token file quoted i
+  token="$1"
+  _claude_curl_config_file_result=""
+  mkdir -p "$TMP_DIR" 2>/dev/null || return 1
+  i=0
+  while [ "$i" -lt 10 ]; do
+    file="$TMP_DIR/.claude-curl-auth.$$.$RANDOM.conf"
+    if ( set -C; umask 077; : >"$file" ) 2>/dev/null; then
+      chmod 600 "$file" 2>/dev/null || { rm -f "$file" 2>/dev/null; return 1; }
+      register_claude_curl_config "$file"
+      quoted="$(curl_config_quote "$token")"
+      printf 'header = "Authorization: Bearer %s"\n' "$quoted" >"$file" 2>/dev/null || {
+        rm -f "$file" 2>/dev/null
+        return 1
+      }
+      _claude_curl_config_file_result="$file"
+      return 0
+    fi
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+remove_claude_curl_config() {
+  local file kept entry
+  file="$1"
+  rm -f "$file" 2>/dev/null
+  kept=""
+  while IFS= read entry; do
+    [ -n "$entry" ] || continue
+    [ "$entry" = "$file" ] && continue
+    if [ -n "$kept" ]; then
+      kept="$kept
+$entry"
+    else
+      kept="$entry"
+    fi
+  done <<EOF
+$_claude_curl_config_files
+EOF
+  _claude_curl_config_files="$kept"
+}
+
 fetch_claude_once() {
-  local out_file err_file token response curl_status status body now transformed
+  local out_file err_file token response curl_status status body now transformed curl_config
   out_file="$1"
   err_file="$2"
   token="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null \
@@ -361,12 +432,18 @@ fetch_claude_once() {
     printf '%s\n' 'missing_token' >"$err_file"
     return 10
   fi
+  create_claude_curl_config "$token" || {
+    printf '%s\n' 'curl_config_error' >"$err_file"
+    return 13
+  }
+  curl_config="$_claude_curl_config_file_result"
   response="$(curl -sS --max-time "$REQUEST_TIMEOUT" \
     -w '\n%{http_code}' \
-    -H "Authorization: Bearer $token" \
+    --config "$curl_config" \
     -H "anthropic-beta: oauth-2025-04-20" \
     "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)"
   curl_status=$?
+  remove_claude_curl_config "$curl_config"
   if [ "$curl_status" -ne 0 ]; then
     printf 'curl_exit=%s\n' "$curl_status" >"$err_file"
     return "$curl_status"
@@ -669,9 +746,9 @@ refresh_service() {
 main() {
   load_config
   local mode
-  trap 'cleanup_locks; cleanup_codex_server; exit 130' INT
-  trap 'cleanup_locks; cleanup_codex_server; exit 143' TERM
-  trap 'cleanup_locks; cleanup_codex_server'           EXIT
+  trap 'cleanup_locks; cleanup_claude_curl_configs; cleanup_codex_server; exit 130' INT
+  trap 'cleanup_locks; cleanup_claude_curl_configs; cleanup_codex_server; exit 143' TERM
+  trap 'cleanup_locks; cleanup_claude_curl_configs; cleanup_codex_server'           EXIT
   mode="${1:-all}"
   case "$mode" in
     claude|codex|all) ;;

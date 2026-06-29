@@ -111,10 +111,9 @@ Edit `~/.config/claude-codex-usage/config.sh`. If you change `REFRESH_INTERVAL`,
 | `NOTIFY_SOUND` | `Ping` | macOS notification sound name. |
 | `RESET_HOOK` | `""` | Path to an external script called after a reset notification. |
 | `HOOK_TIMEOUT` | `60` | Timeout in seconds for `RESET_HOOK`. |
-| `USAGE_NARROW_BELOW` | `125` | Omit gauge bars below this terminal column count. |
+| `USAGE_NARROW_BELOW` | `100` | Omit gauge bars below this terminal column count. |
 | `CELLS` | `8` | Gauge bar width in cells. |
 | `STALE_MINUTES` | `10` | Show stale marker after this many minutes. |
-| `SLEEP_STALE_MINUTES` | `5` | Cache age threshold used for sleep-resume stale detection. |
 
 ## Notifications
 
@@ -249,10 +248,9 @@ launchd（1分ごと） -> refresh.sh -> ~/.cache/claude-codex-usage/*.json -> t
 | `NOTIFY_SOUND` | `Ping` | 通知サウンド名 |
 | `RESET_HOOK` | `""` | リセット通知後に呼ぶ外部スクリプトのパス |
 | `HOOK_TIMEOUT` | `60` | `RESET_HOOK` のタイムアウト（秒） |
-| `USAGE_NARROW_BELOW` | `125` | この列数未満でゲージ棒を省略 |
+| `USAGE_NARROW_BELOW` | `100` | この列数未満でゲージ棒を省略 |
 | `CELLS` | `8` | ゲージ棒の幅（セル数） |
 | `STALE_MINUTES` | `10` | stale 表示のしきい値（分） |
-| `SLEEP_STALE_MINUTES` | `5` | スリープ復帰時の stale 判定しきい値（分） |
 
 ## 通知機能
 

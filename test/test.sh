@@ -137,6 +137,29 @@ test_uninstall_purge_cache_guard() {
   fi
 }
 
+test_uninstall_purge_cache_canonical_guard() {
+  home_dir="$tmp/uninstall-canonical-home"
+  cfg_home="$tmp/uninstall-canonical-config"
+  cache_home="$tmp/uninstall-canonical-cache"
+  allowed="$cache_home/claude-codex-usage"
+  outside="$tmp/uninstall-outside/claude-codex-usage"
+  mkdir -p "$home_dir/Library/LaunchAgents" "$cfg_home/claude-codex-usage" "$allowed" "$outside"
+
+  printf '%s\n' "CACHE_DIR=\"$cache_home/claude-codex-usage/../../uninstall-outside/claude-codex-usage\"" >"$cfg_home/claude-codex-usage/config.sh"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  status=$?
+  assert_eq "purge-cache rejects dot-dot outside root status" "2" "$status"
+  assert_contains "purge-cache rejects dot-dot outside root message" "$out" "outside allowed root"
+
+  mkdir -p "$allowed"
+  ln -s "$tmp/uninstall-outside" "$allowed/escape"
+  printf '%s\n' "CACHE_DIR=\"$allowed/escape/claude-codex-usage\"" >"$cfg_home/claude-codex-usage/config.sh"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  status=$?
+  assert_eq "purge-cache rejects symlink outside root status" "2" "$status"
+  assert_contains "purge-cache rejects symlink outside root message" "$out" "outside allowed root"
+}
+
 test_json_transform() {
   now=1782585600
   claude_raw='{"five_hour":{"utilization":42,"resets_at":"2026-06-28T12:34:56Z"},"seven_day":{"utilization":18,"resets_at":"2026-07-01T00:00:00Z"}}'
@@ -223,6 +246,79 @@ test_sanitized_fetch_logging() {
   }
   log_output="$(retry_fetch claude "$out_file" "$err_file" 2>&1)"
   assert_contains "fetch log includes safe token" "$log_output" "token=http_status=401"
+}
+
+test_fetch_claude_auth_uses_curl_config() {
+  mock_bin="$tmp/mock-curl-bin"
+  home_dir="$tmp/mock-claude-home"
+  cache_dir="$tmp/mock-claude-cache"
+  mkdir -p "$mock_bin" "$home_dir/.claude" "$cache_dir/tmp"
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"dummy-oauth-token"}}' >"$home_dir/.claude/.credentials.json"
+  cat >"$mock_bin/curl" <<'EOF'
+#!/bin/bash
+config=""
+printf '%s\n' "$@" >"$MOCK_CURL_ARGS_FILE"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config|-K)
+      shift
+      config="$1"
+      ;;
+  esac
+  shift
+done
+printf '%s' "$config" >"$MOCK_CURL_CONFIG_PATH_FILE"
+if [ -n "$config" ] && [ -f "$config" ]; then
+  if grep 'Authorization: Bearer dummy-oauth-token' "$config" >/dev/null 2>&1; then
+    printf '%s\n' yes >"$MOCK_CURL_CONFIG_HAS_TOKEN_FILE"
+  else
+    printf '%s\n' no >"$MOCK_CURL_CONFIG_HAS_TOKEN_FILE"
+  fi
+  perm="$(stat -f '%Lp' "$config" 2>/dev/null || stat -c '%a' "$config" 2>/dev/null)"
+  printf '%s' "$perm" >"$MOCK_CURL_CONFIG_PERM_FILE"
+else
+  printf '%s\n' no >"$MOCK_CURL_CONFIG_HAS_TOKEN_FILE"
+fi
+printf '%s\n%s\n' '{"five_hour":{"utilization":12},"seven_day":{"utilization":34}}' '200'
+EOF
+  chmod +x "$mock_bin/curl"
+
+  old_path="$PATH"
+  old_home="$HOME"
+  old_tmp_dir="$TMP_DIR"
+  old_request_timeout="$REQUEST_TIMEOUT"
+  PATH="$mock_bin:$PATH"
+  HOME="$home_dir"
+  TMP_DIR="$cache_dir/tmp"
+  REQUEST_TIMEOUT=15
+  MOCK_CURL_ARGS_FILE="$tmp/mock-curl-args.txt"
+  MOCK_CURL_CONFIG_PATH_FILE="$tmp/mock-curl-config-path.txt"
+  MOCK_CURL_CONFIG_HAS_TOKEN_FILE="$tmp/mock-curl-config-token.txt"
+  MOCK_CURL_CONFIG_PERM_FILE="$tmp/mock-curl-config-perm.txt"
+  export MOCK_CURL_ARGS_FILE MOCK_CURL_CONFIG_PATH_FILE MOCK_CURL_CONFIG_HAS_TOKEN_FILE MOCK_CURL_CONFIG_PERM_FILE
+
+  out_file="$tmp/mock-claude.out"
+  err_file="$tmp/mock-claude.err"
+  fetch_claude_once "$out_file" "$err_file"
+  status=$?
+  args="$(cat "$MOCK_CURL_ARGS_FILE")"
+  config_path="$(cat "$MOCK_CURL_CONFIG_PATH_FILE")"
+  assert_eq "claude fetch via mocked curl succeeds" "0" "$status"
+  assert_contains "claude fetch passes curl config argv" "$args" "--config"
+  assert_not_contains "claude token omitted from curl argv" "$args" "dummy-oauth-token"
+  assert_eq "claude auth config contains token header" "yes" "$(cat "$MOCK_CURL_CONFIG_HAS_TOKEN_FILE")"
+  assert_eq "claude auth config is 0600" "600" "$(cat "$MOCK_CURL_CONFIG_PERM_FILE")"
+  if [ -e "$config_path" ]; then
+    not_ok "claude auth config removed after curl"
+  else
+    ok "claude auth config removed after curl"
+  fi
+
+  PATH="$old_path"
+  HOME="$old_home"
+  TMP_DIR="$old_tmp_dir"
+  REQUEST_TIMEOUT="$old_request_timeout"
+  unset MOCK_CURL_ARGS_FILE MOCK_CURL_CONFIG_PATH_FILE MOCK_CURL_CONFIG_HAS_TOKEN_FILE MOCK_CURL_CONFIG_PERM_FILE
 }
 
 test_failure_update() {
@@ -405,9 +501,11 @@ test_syntax() {
 test_lock_cleanup_trap
 test_invalid_numeric_config_fallback
 test_uninstall_purge_cache_guard
+test_uninstall_purge_cache_canonical_guard
 test_json_transform
 test_usage_payload_validation
 test_parse_failure_cache
+test_fetch_claude_auth_uses_curl_config
 test_sanitized_fetch_logging
 test_failure_update
 test_transient_refresh_failures

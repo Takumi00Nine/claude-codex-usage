@@ -25,10 +25,42 @@ normalize_path_no_trailing_slash() {
   printf '%s' "$path"
 }
 
+canonicalize_existing_or_parent() {
+  local path parent base canonical_parent
+  path="$(normalize_path_no_trailing_slash "$1")"
+  [ -n "$path" ] || return 1
+  if [ -e "$path" ]; then
+    ( cd "$path" 2>/dev/null && pwd -P ) || return 1
+    return 0
+  fi
+  parent="$(dirname "$path")"
+  base="$(basename "$path")"
+  canonical_parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+  if [ "$canonical_parent" = "/" ]; then
+    printf '/%s\n' "$base"
+  else
+    printf '%s/%s\n' "$canonical_parent" "$base"
+  fi
+}
+
 validate_purge_cache_dir() {
-  local target home rest
-  target="$(normalize_path_no_trailing_slash "$CACHE_DIR")"
-  home="$(normalize_path_no_trailing_slash "$HOME")"
+  local target home rest default_cache_root allowed_root
+  target="$(canonicalize_existing_or_parent "$CACHE_DIR")" || {
+    printf 'refusing to purge unresolved cache dir: %s\n' "${CACHE_DIR:-<empty>}" >&2
+    return 1
+  }
+  target="$(normalize_path_no_trailing_slash "$target")"
+  home="$(canonicalize_existing_or_parent "$HOME")" || {
+    printf 'refusing to purge unresolved HOME: %s\n' "${HOME:-<empty>}" >&2
+    return 1
+  }
+  home="$(normalize_path_no_trailing_slash "$home")"
+  default_cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
+  allowed_root="$(canonicalize_existing_or_parent "$default_cache_root")" || {
+    printf 'refusing to purge unresolved cache root: %s\n' "$default_cache_root" >&2
+    return 1
+  }
+  allowed_root="$(normalize_path_no_trailing_slash "$allowed_root")"
   case "$target" in
     ""|"/")
       printf 'refusing to purge unsafe cache dir: %s\n' "${target:-<empty>}" >&2
@@ -49,6 +81,13 @@ validate_purge_cache_dir() {
           return 1
           ;;
       esac
+      ;;
+  esac
+  case "$target" in
+    "$allowed_root"|"$allowed_root"/*) ;;
+    *)
+      printf 'refusing to purge cache dir outside allowed root: %s\n' "$target" >&2
+      return 1
       ;;
   esac
   case "$target" in
