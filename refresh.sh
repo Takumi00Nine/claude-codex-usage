@@ -112,6 +112,20 @@ is_transient_fetch_status() {
   esac
 }
 
+safe_error_token() {
+  value="$(cat "$1" 2>/dev/null | tail -n 1)"
+  case "$value" in
+    http_status=[0-9][0-9][0-9]) printf '%s' "$value"; return 0 ;;
+    curl_exit=[0-9]|curl_exit=[0-9][0-9]|curl_exit=[0-9][0-9][0-9]) printf '%s' "$value"; return 0 ;;
+    rate_limited) printf '%s' "$value"; return 0 ;;
+    missing_token) printf '%s' "$value"; return 0 ;;
+    parse_error) printf '%s' "$value"; return 0 ;;
+    codex_timeout) printf '%s' "$value"; return 0 ;;
+    codex_unavailable) printf '%s' "$value"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 lock_max_age() {
   printf '%s\n' $(( REQUEST_TIMEOUT * (RETRY_COUNT + 1) + HOOK_TIMEOUT + 30 ))
 }
@@ -243,6 +257,29 @@ transform_codex_usage() {
     }' 2>/dev/null
 }
 
+validate_usage_payload() {
+  service="$1"
+  payload="$2"
+  printf '%s' "$payload" | jq -e --arg service "$service" '
+    .schema_version == 1
+    and .service == $service
+    and (.five_hour.used_percent | type == "number" and . >= 0 and . <= 100)
+    and (.seven_day.used_percent | type == "number" and . >= 0 and . <= 100)
+  ' >/dev/null 2>&1
+}
+
+write_validated_usage_payload() {
+  service="$1"
+  payload="$2"
+  out_file="$3"
+  err_file="$4"
+  validate_usage_payload "$service" "$payload" || {
+    printf '%s\n' 'parse_error' >"$err_file"
+    return 11
+  }
+  printf '%s\n' "$payload" >"$out_file"
+}
+
 fetch_claude_once() {
   out_file="$1"
   err_file="$2"
@@ -253,27 +290,33 @@ fetch_claude_once() {
       "$HOME/.claude/.credentials.json" 2>/dev/null)"
   fi
   if [ -z "$token" ]; then
-    printf '%s\n' 'missing Claude token in keychain or credentials file' >"$err_file"
+    printf '%s\n' 'missing_token' >"$err_file"
     return 10
   fi
   response="$(curl -sS --max-time "$REQUEST_TIMEOUT" \
     -w '\n%{http_code}' \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
-    "https://api.anthropic.com/api/oauth/usage" 2>"$err_file")"
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)"
   curl_status=$?
-  [ "$curl_status" -eq 0 ] || return "$curl_status"
+  if [ "$curl_status" -ne 0 ]; then
+    printf 'curl_exit=%s\n' "$curl_status" >"$err_file"
+    return "$curl_status"
+  fi
   status="$(printf '%s\n' "$response" | tail -n 1)"
   body="$(printf '%s\n' "$response" | sed '$d')"
   case "$status" in
     2??)
       now="$(now_epoch)"
-      transformed="$(transform_claude_usage "$body" "$now")" || return 11
-      printf '%s\n' "$transformed" >"$out_file"
+      transformed="$(transform_claude_usage "$body" "$now")" || {
+        printf '%s\n' 'parse_error' >"$err_file"
+        return 11
+      }
+      write_validated_usage_payload claude "$transformed" "$out_file" "$err_file" || return 11
       return 0
       ;;
-    429) printf '%s\n' "$status" >"$err_file"; return 42 ;;
-    *) printf '%s\n' "$status" >"$err_file"; return 12 ;;
+    429) printf '%s\n' 'rate_limited' >"$err_file"; return 42 ;;
+    *) printf 'http_status=%s\n' "$status" >"$err_file"; return 12 ;;
   esac
 }
 
@@ -321,18 +364,23 @@ fetch_codex_once() {
   wait "$_codex_writer_pid" 2>/dev/null
   wait "$_codex_server_pid" 2>/dev/null
   if [ -z "$result" ]; then
-    cat "$server_err" >"$err_file" 2>/dev/null
+    printf '%s\n' 'codex_timeout' >"$err_file"
     rm -rf "$_codex_tmp_dir" 2>/dev/null
     _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
     return 124
   fi
   now="$(now_epoch)"
   transformed="$(transform_codex_usage "$result" "$now")" || {
+    printf '%s\n' 'parse_error' >"$err_file"
     rm -rf "$_codex_tmp_dir" 2>/dev/null
     _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
     return 11
   }
-  printf '%s\n' "$transformed" >"$out_file"
+  write_validated_usage_payload codex "$transformed" "$out_file" "$err_file" || {
+    rm -rf "$_codex_tmp_dir" 2>/dev/null
+    _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
+    return 11
+  }
   rm -rf "$_codex_tmp_dir" 2>/dev/null
   _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
   return 0
@@ -357,8 +405,8 @@ retry_fetch() {
       log "$service: fetch OK (attempt $attempt/$max_attempts)"
       return 0
     fi
-    err_detail="$(cat "$err_file" 2>/dev/null | head -1)"
-    log "$service: fetch FAILED status=$last_status attempt=$attempt/$max_attempts${err_detail:+ ($err_detail)}"
+    err_detail="$(safe_error_token "$err_file")"
+    log "$service: fetch FAILED status=$last_status attempt=$attempt/$max_attempts${err_detail:+ token=$err_detail}"
     if [ "$last_status" -eq 42 ]; then
       log "$service: rate limited; retry suppressed until next refresh cycle"
       break
@@ -533,12 +581,12 @@ refresh_service() {
   case "$fetch_status" in
     10) error_type="auth"; message="authentication failed"; status_json="null" ;;
     11) error_type="parse"; message="failed to parse usage response"; status_json="null" ;;
-    12) error_type="http"; message="HTTP request failed"; status_json="$(cat "$err" 2>/dev/null | tail -n 1)";;
+    12) error_type="http"; message="HTTP request failed"; status_json="$(safe_error_token "$err" | sed 's/^http_status=//')" ;;
     42) error_type="http"; message="rate limited"; status_json="429" ;;
     124) error_type="timeout"; message="request timed out"; status_json="null" ;;
     *) error_type="command"; message="usage command failed"; status_json="null" ;;
   esac
-  case "$status_json" in ''|*[!0-9]*) status_json="null" ;; esac
+  case "$status_json" in [1-9][0-9][0-9]) ;; *) status_json="null" ;; esac
   write_failure_cache "$service" "$cache" "$error_type" "$message" "$status_json" "$attempts"
   rm -f "$out" "$err" 2>/dev/null
   return 0

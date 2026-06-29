@@ -39,6 +39,16 @@ assert_contains() {
   esac
 }
 
+assert_not_contains() {
+  name="$1"
+  haystack="$2"
+  needle="$3"
+  case "$haystack" in
+    *"$needle"*) not_ok "$name: unexpected [$needle] in [$haystack]" ;;
+    *) ok "$name" ;;
+  esac
+}
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/ccu-test.XXXXXX")" || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
@@ -61,6 +71,81 @@ test_json_transform() {
   out="$(transform_codex_usage "$codex_raw" "$now")"
   assert_eq "codex transform service" "codex" "$(printf '%s' "$out" | jq -r '.service')"
   assert_eq "codex transform weekly" "44" "$(printf '%s' "$out" | jq -r '.seven_day.used_percent')"
+}
+
+test_usage_payload_validation() {
+  out_file="$tmp/validated.out"
+  err_file="$tmp/validated.err"
+  valid='{"schema_version":1,"service":"claude","fetched_at":1,"updated_at":1,"five_hour":{"used_percent":42},"seven_day":{"used_percent":18},"last_error":null}'
+  write_validated_usage_payload claude "$valid" "$out_file" "$err_file"
+  assert_eq "validated payload writes output" "42" "$(jq -r '.five_hour.used_percent' "$out_file")"
+
+  rm -f "$out_file" "$err_file"
+  invalid_null='{"schema_version":1,"service":"claude","fetched_at":1,"updated_at":1,"five_hour":{"used_percent":null},"seven_day":{"used_percent":18},"last_error":null}'
+  write_validated_usage_payload claude "$invalid_null" "$out_file" "$err_file"
+  assert_eq "null percent rejected status" "11" "$?"
+  assert_eq "null percent records parse token" "parse_error" "$(cat "$err_file")"
+  if [ -f "$out_file" ]; then
+    not_ok "null percent does not write output"
+  else
+    ok "null percent does not write output"
+  fi
+
+  rm -f "$out_file" "$err_file"
+  invalid_range='{"schema_version":1,"service":"codex","fetched_at":1,"updated_at":1,"five_hour":{"used_percent":101},"seven_day":{"used_percent":18},"last_error":null}'
+  write_validated_usage_payload codex "$invalid_range" "$out_file" "$err_file"
+  assert_eq "range percent rejected status" "11" "$?"
+}
+
+test_parse_failure_cache() {
+  export XDG_CACHE_HOME="$tmp/parse-cache"
+  CACHE_DIR="$XDG_CACHE_HOME/claude-codex-usage"
+  LOCK_DIR="$CACHE_DIR/locks"
+  TMP_DIR="$CACHE_DIR/tmp"
+  CODEX_CACHE="$CACHE_DIR/codex-cache.json"
+  NOTIFY_STATE="$CACHE_DIR/notify-state.json"
+  mkdir -p "$CACHE_DIR" "$LOCK_DIR" "$TMP_DIR"
+  RETRY_COUNT=0
+  old='{"schema_version":1,"service":"codex","fetched_at":300,"updated_at":300,"five_hour":{"used_percent":60,"resets_at_epoch":null},"seven_day":{"used_percent":20,"resets_at_epoch":null},"last_error":null}'
+  printf '%s\n' "$old" >"$CODEX_CACHE"
+
+  fetch_codex_once() {
+    out_file="$1"
+    err_file="$2"
+    printf '%s\n' 'parse_error' >"$err_file"
+    : >"$out_file"
+    return 11
+  }
+
+  refresh_service codex >/dev/null 2>&1
+  assert_eq "parse writes error type" "parse" "$(jq -r '.last_error.type' "$CODEX_CACHE")"
+  assert_eq "parse keeps previous usage" "60" "$(jq -r '.five_hour.used_percent' "$CODEX_CACHE")"
+}
+
+test_sanitized_fetch_logging() {
+  RETRY_COUNT=0
+  out_file="$tmp/logging.out"
+  err_file="$tmp/logging.err"
+  fetch_claude_once() {
+    out_file="$1"
+    err_file="$2"
+    printf '%s\n' 'secret-token-value' >"$err_file"
+    : >"$out_file"
+    return 12
+  }
+  log_output="$(retry_fetch claude "$out_file" "$err_file" 2>&1)"
+  assert_not_contains "fetch log omits raw stderr" "$log_output" "secret-token-value"
+  assert_contains "fetch log keeps exit status" "$log_output" "status=12"
+
+  fetch_claude_once() {
+    out_file="$1"
+    err_file="$2"
+    printf '%s\n' 'http_status=401' >"$err_file"
+    : >"$out_file"
+    return 12
+  }
+  log_output="$(retry_fetch claude "$out_file" "$err_file" 2>&1)"
+  assert_contains "fetch log includes safe token" "$log_output" "token=http_status=401"
 }
 
 test_failure_update() {
@@ -133,7 +218,7 @@ test_non_transient_refresh_failure() {
   fetch_claude_once() {
     out_file="$1"
     err_file="$2"
-    printf '%s\n' 401 >"$err_file"
+    printf '%s\n' 'http_status=401' >"$err_file"
     : >"$out_file"
     return 12
   }
@@ -214,6 +299,22 @@ test_plist_generation() {
   assert_contains "plist includes minute 58" "$p120" "<integer>58</integer>"
 }
 
+test_install_config_order() {
+  export XDG_CONFIG_HOME="$tmp/install-config"
+  export XDG_CACHE_HOME="$tmp/install-cache"
+  CONFIG_DIR="$XDG_CONFIG_HOME/claude-codex-usage"
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' 'REFRESH_INTERVAL="${REFRESH_INTERVAL:-120}"' >"$CONFIG_DIR/config.sh"
+  printf '%s\n' 'REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-9}"' >>"$CONFIG_DIR/config.sh"
+  unset REFRESH_INTERVAL REQUEST_TIMEOUT
+  load_config
+  assert_eq "install config default expression wins" "120" "$REFRESH_INTERVAL"
+  assert_eq "install config timeout expression wins" "9" "$REQUEST_TIMEOUT"
+  p120="$(generate_plist "/usr/bin:/bin")"
+  c120="$(printf '%s\n' "$p120" | grep -c '<key>Minute</key>')"
+  assert_eq "install plist uses configured interval" "30" "$c120"
+}
+
 test_syntax() {
   for f in refresh.sh tmux-usage.sh install.sh uninstall.sh test/test.sh; do
     if /bin/bash -n "$ROOT/$f"; then
@@ -225,12 +326,16 @@ test_syntax() {
 }
 
 test_json_transform
+test_usage_payload_validation
+test_parse_failure_cache
+test_sanitized_fetch_logging
 test_failure_update
 test_transient_refresh_failures
 test_non_transient_refresh_failure
 test_notifications
 test_tmux_display
 test_plist_generation
+test_install_config_order
 test_syntax
 
 printf 'RESULT pass=%s fail=%s\n' "$PASS" "$FAIL"

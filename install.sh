@@ -4,6 +4,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 LABEL="com.claude-codex-usage.refresh"
 
 load_config() {
+  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-codex-usage"
+  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
+  LOG_DIR="$HOME/Library/Logs/claude-codex-usage"
+  LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
+  PLIST_PATH="$LAUNCHAGENT_DIR/$LABEL.plist"
+  CONFIG_FILE="$CONFIG_DIR/config.sh"
+  if [ -f "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+  fi
   REFRESH_INTERVAL="${REFRESH_INTERVAL:-60}"
   REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-15}"
   RETRY_COUNT="${RETRY_COUNT:-2}"
@@ -17,15 +26,6 @@ load_config() {
   CELLS="${CELLS:-8}"
   STALE_MINUTES="${STALE_MINUTES:-10}"
   SLEEP_STALE_MINUTES="${SLEEP_STALE_MINUTES:-5}"
-  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-codex-usage"
-  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
-  LOG_DIR="$HOME/Library/Logs/claude-codex-usage"
-  LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
-  PLIST_PATH="$LAUNCHAGENT_DIR/$LABEL.plist"
-  CONFIG_FILE="$CONFIG_DIR/config.sh"
-  if [ -f "$CONFIG_FILE" ]; then
-    . "$CONFIG_FILE"
-  fi
 }
 
 xml_escape() {
