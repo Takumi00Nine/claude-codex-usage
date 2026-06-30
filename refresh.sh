@@ -141,10 +141,24 @@ atomic_write() {
 }
 
 run_with_timeout() {
-  local seconds flag child watcher status
+  local seconds timeout_base timeout_dir flag child watcher status i
   seconds="$1"
   shift
-  flag="${TMPDIR:-/tmp}/claude-codex-timeout.$$.$RANDOM"
+  timeout_base="${TMP_DIR:-${TMPDIR:-/tmp}}"
+  mkdir -p "$timeout_base" 2>/dev/null || timeout_base="${TMPDIR:-/tmp}"
+  timeout_dir=""
+  i=0
+  while [ "$i" -lt 10 ]; do
+    timeout_dir="$timeout_base/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null && break
+    timeout_dir=""
+    i=$(( i + 1 ))
+  done
+  if [ -z "$timeout_dir" ]; then
+    timeout_dir="${TMPDIR:-/tmp}/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null || return 1
+  fi
+  flag="$timeout_dir/flag"
   "$@" &
   child=$!
   (
@@ -162,10 +176,10 @@ run_with_timeout() {
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   if [ -f "$flag" ]; then
-    rm -f "$flag" 2>/dev/null
+    rm -rf "$timeout_dir" 2>/dev/null
     return 124
   fi
-  rm -f "$flag" 2>/dev/null
+  rm -rf "$timeout_dir" 2>/dev/null
   return "$status"
 }
 
@@ -184,6 +198,7 @@ safe_error_token() {
     curl_exit=[0-9]|curl_exit=[0-9][0-9]|curl_exit=[0-9][0-9][0-9]) printf '%s' "$value"; return 0 ;;
     rate_limited) printf '%s' "$value"; return 0 ;;
     missing_token) printf '%s' "$value"; return 0 ;;
+    invalid_token) printf '%s' "$value"; return 0 ;;
     parse_error) printf '%s' "$value"; return 0 ;;
     codex_timeout) printf '%s' "$value"; return 0 ;;
     codex_unavailable) printf '%s' "$value"; return 0 ;;
@@ -363,6 +378,13 @@ curl_config_quote() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+token_has_crlf() {
+  case "$1" in
+    *$'\r'*|*$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 register_claude_curl_config() {
   local file
   file="$1"
@@ -430,6 +452,10 @@ fetch_claude_once() {
   fi
   if [ -z "$token" ]; then
     printf '%s\n' 'missing_token' >"$err_file"
+    return 10
+  fi
+  if token_has_crlf "$token"; then
+    printf '%s\n' 'invalid_token' >"$err_file"
     return 10
   fi
   create_claude_curl_config "$token" || {

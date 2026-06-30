@@ -43,8 +43,12 @@ canonicalize_existing_or_parent() {
   fi
 }
 
+path_owner_uid() {
+  stat -f '%u' "$1" 2>/dev/null || stat -c '%u' "$1" 2>/dev/null
+}
+
 validate_purge_cache_dir() {
-  local target home rest default_cache_root allowed_root
+  local target home rest default_cache_root allowed_root allowed_owner uid
   target="$(canonicalize_existing_or_parent "$CACHE_DIR")" || {
     printf 'refusing to purge unresolved cache dir: %s\n' "${CACHE_DIR:-<empty>}" >&2
     return 1
@@ -61,6 +65,17 @@ validate_purge_cache_dir() {
     return 1
   }
   allowed_root="$(normalize_path_no_trailing_slash "$allowed_root")"
+  if [ -e "$allowed_root" ]; then
+    uid="$(id -u)"
+    allowed_owner="$(path_owner_uid "$allowed_root")" || {
+      printf 'refusing to purge cache root with unknown owner: %s\n' "$allowed_root" >&2
+      return 1
+    }
+    if [ "$allowed_owner" != "$uid" ]; then
+      printf 'refusing to purge cache root owned by uid %s: %s\n' "$allowed_owner" "$allowed_root" >&2
+      return 1
+    fi
+  fi
   case "$target" in
     ""|"/")
       printf 'refusing to purge unsafe cache dir: %s\n' "${target:-<empty>}" >&2
@@ -102,7 +117,7 @@ validate_purge_cache_dir() {
 }
 
 main() {
-  local purge uid
+  local purge uid purge_target
   purge=0
   case "${1:-}" in
     "") ;;
@@ -122,6 +137,15 @@ main() {
   fi
   if [ "$purge" -eq 1 ]; then
     validate_purge_cache_dir || return 2
+    purge_target="$CACHE_DIR"
+    if [ -n "${CLAUDE_CODEX_USAGE_TEST_PURGE_SWAP_HOOK:-}" ]; then
+      "$CLAUDE_CODEX_USAGE_TEST_PURGE_SWAP_HOOK" || return 2
+    fi
+    validate_purge_cache_dir || return 2
+    if [ "$CACHE_DIR" != "$purge_target" ]; then
+      printf 'refusing to purge cache dir changed during validation: %s -> %s\n' "$purge_target" "$CACHE_DIR" >&2
+      return 2
+    fi
     printf 'purging cache dir: %s\n' "$CACHE_DIR"
     rm -rf "$CACHE_DIR" 2>/dev/null || return 1
     printf 'removed %s\n' "$CACHE_DIR"

@@ -501,7 +501,7 @@ uninstall.sh --purge-cache
 - HTTP は `curl --max-time "$REQUEST_TIMEOUT"` で制限する。
 - `codex app-server`、`osascript`、`RESET_HOOK` はサブシェルと watchdog で制限する。
 - リトライは初回 + `RETRY_COUNT` 回。`RETRY_COUNT=2` なら最大3回。
-- 429 は指数バックオフ、その他は短い固定バックオフにする。
+- 429 は追加リトライせず次回更新まで待つ。その他のリトライ対象失敗は 1 秒の固定バックオフにする。指数バックオフは現行実装では廃止する。
 
 ### 6.2 Claude トークン取得と API 呼び出し
 
@@ -528,7 +528,7 @@ curl -sS --max-time "$REQUEST_TIMEOUT" \
   "https://api.anthropic.com/api/oauth/usage"
 ```
 
-HTTP body と status を分離して、2xx 以外は `last_error.type="http"` にする。429 の場合は `sleep 1, 2, 4...` の指数バックオフを行う。ただし各 sleep は最大30秒に丸める。
+HTTP body と status を分離して、2xx 以外は `last_error.type="http"` にする。429 の場合は一過性失敗として扱い、直前キャッシュを維持して追加リトライを行わない。
 
 ### 6.3 汎用コマンドタイムアウト
 
@@ -536,10 +536,24 @@ bash 3.2 互換で外部コマンドを制限する。
 
 ```bash
 run_with_timeout() {
-  local seconds flag child watcher status
+  local seconds timeout_base timeout_dir flag child watcher status i
   seconds="$1"
   shift
-  flag="${TMPDIR:-/tmp}/claude-codex-timeout.$$.$RANDOM"
+  timeout_base="${TMP_DIR:-${TMPDIR:-/tmp}}"
+  mkdir -p "$timeout_base" 2>/dev/null || timeout_base="${TMPDIR:-/tmp}"
+  timeout_dir=""
+  i=0
+  while [ "$i" -lt 10 ]; do
+    timeout_dir="$timeout_base/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null && break
+    timeout_dir=""
+    i=$(( i + 1 ))
+  done
+  if [ -z "$timeout_dir" ]; then
+    timeout_dir="${TMPDIR:-/tmp}/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null || return 1
+  fi
+  flag="$timeout_dir/flag"
   "$@" &
   child=$!
   (
@@ -557,15 +571,15 @@ run_with_timeout() {
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   if [ -f "$flag" ]; then
-    rm -f "$flag" 2>/dev/null
+    rm -rf "$timeout_dir" 2>/dev/null
     return 124
   fi
-  rm -f "$flag" 2>/dev/null
+  rm -rf "$timeout_dir" 2>/dev/null
   return "$status"
 }
 ```
 
-タイムアウト時の終了コードは 124（GNU `timeout` と同じ値）。フラグファイルでタイムアウト判定するため、`child` がゼロ以外で終了した場合でも正確に区別できる。呼び出し側は `[ $? -eq 124 ]` で `last_error.type="timeout"` に分岐する。
+タイムアウト時の終了コードは 124（GNU `timeout` と同じ値）。`TMP_DIR` 配下のユニークな一時ディレクトリ内に置くフラグファイルでタイムアウト判定するため、`child` がゼロ以外で終了した場合でも正確に区別できる。呼び出し側は `[ $? -eq 124 ]` で `last_error.type="timeout"` に分岐する。
 
 子プロセスがさらに子を作る可能性がある `codex app-server` では、後述の接続管理で個別に `kill` と `wait` を行う。
 
@@ -581,18 +595,16 @@ while [ "$attempt" -lt "$max_attempts" ]; do
   fi
 
   [ "$attempt" -lt "$max_attempts" ] || break
-  if [ "$last_status" = "429" ]; then
-    sleep_seconds=$(( 1 << (attempt - 1) ))
-    [ "$sleep_seconds" -gt 30 ] && sleep_seconds=30
-  else
-    sleep_seconds=1
+  if [ "$last_status" = "42" ]; then
+    break
   fi
+  sleep_seconds=1
   sleep "$sleep_seconds"
 done
 return 1
 ```
 
-bash 3.2 互換のビットシフト `1 << n` で指数バックオフを実現する（`**` 演算子は bash 4.0 以降のため使用しない）。
+429 は HTTP レート制限を終了コード 42 として扱い、その更新サイクル内の追加リトライを抑止する。その他のリトライ対象失敗は bash 3.2 互換の固定 1 秒 sleep を使う。
 
 ## 7. 通知ステートマシン
 

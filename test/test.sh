@@ -108,6 +108,30 @@ test_lock_cleanup_trap() {
   fi
 }
 
+test_stale_lock_can_be_reacquired() {
+  CACHE_DIR="$tmp/stale-lock-cache/claude-codex-usage"
+  LOCK_DIR="$CACHE_DIR/locks"
+  TMP_DIR="$CACHE_DIR/tmp"
+  REQUEST_TIMEOUT=1
+  RETRY_COUNT=0
+  HOOK_TIMEOUT=1
+  mkdir -p "$LOCK_DIR/stale.lock.d" "$TMP_DIR"
+  printf '%s\n' "$(( $(date '+%s') - 100 ))" >"$LOCK_DIR/stale.lock.d/created_at"
+  stale_marker="$tmp/stale-lock-acquired"
+  stale_lock_body() {
+    printf '%s\n' acquired >"$stale_marker"
+  }
+  with_lock stale stale_lock_body
+  status=$?
+  assert_eq "stale lock reacquire succeeds" "0" "$status"
+  assert_eq "stale lock body runs" "acquired" "$(cat "$stale_marker" 2>/dev/null)"
+  if [ -d "$LOCK_DIR/stale.lock.d" ]; then
+    not_ok "stale lock removed after reacquire"
+  else
+    ok "stale lock removed after reacquire"
+  fi
+}
+
 test_invalid_numeric_config_fallback() {
   cfg_home="$tmp/numeric-config"
   cache_home="$tmp/numeric-cache"
@@ -181,6 +205,27 @@ test_uninstall_purge_cache_canonical_guard() {
   assert_eq "purge-cache rejects symlink outside root status" "2" "$status"
   assert_contains "purge-cache rejects symlink outside root message" "$out" "outside allowed root"
   assert_eq "purge-cache symlink skip prevents launchctl calls" "0" "$(wc -l <"$launchctl_log" | tr -d ' ')"
+
+  mkdir -p "$allowed" "$outside"
+  swap_hook="$tmp/uninstall-swap-hook.sh"
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf 'rm -rf "%s"\n' "$allowed"
+    printf 'ln -s "%s" "%s"\n' "$outside" "$allowed"
+  } >"$swap_hook"
+  chmod +x "$swap_hook"
+  printf '%s\n' "CACHE_DIR=\"$allowed\"" >"$cfg_home/claude-codex-usage/config.sh"
+  : >"$launchctl_log"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" CLAUDE_CODEX_USAGE_TEST_PURGE_SWAP_HOOK="$swap_hook" run_with_launchctl_skip "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  status=$?
+  assert_eq "purge-cache rejects pre-rm swap status" "2" "$status"
+  assert_contains "purge-cache rejects pre-rm swap message" "$out" "changed during validation"
+  if [ -d "$outside" ]; then
+    ok "purge-cache pre-rm swap leaves outside intact"
+  else
+    not_ok "purge-cache pre-rm swap leaves outside intact"
+  fi
+  assert_eq "purge-cache pre-rm swap skip prevents launchctl calls" "0" "$(wc -l <"$launchctl_log" | tr -d ' ')"
 }
 
 test_uninstall_launchctl_stub() {
@@ -356,6 +401,84 @@ EOF
   TMP_DIR="$old_tmp_dir"
   REQUEST_TIMEOUT="$old_request_timeout"
   unset MOCK_CURL_ARGS_FILE MOCK_CURL_CONFIG_PATH_FILE MOCK_CURL_CONFIG_HAS_TOKEN_FILE MOCK_CURL_CONFIG_PERM_FILE
+}
+
+test_fetch_claude_rejects_crlf_token() {
+  mock_bin="$tmp/mock-invalid-token-bin"
+  cache_home="$tmp/mock-invalid-token-cache"
+  home_dir="$tmp/mock-invalid-token-home"
+  mkdir -p "$mock_bin" "$cache_home/claude-codex-usage/tmp" "$home_dir/.claude"
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' 'exit 1'
+  } >"$mock_bin/security"
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' 'printf "%s\n" called >>"$MOCK_CURL_CALLED_FILE"'
+    printf '%s\n' 'printf "%s\n%s\n" "{}" "401"'
+  } >"$mock_bin/curl"
+  chmod +x "$mock_bin/security" "$mock_bin/curl"
+
+  old_path="$PATH"
+  old_home="$HOME"
+  old_xdg_cache_home="${XDG_CACHE_HOME:-}"
+  old_cache_dir="$CACHE_DIR"
+  old_lock_dir="$LOCK_DIR"
+  old_tmp_dir="$TMP_DIR"
+  old_claude_cache="$CLAUDE_CACHE"
+  old_notify_state="$NOTIFY_STATE"
+  old_retry_count="$RETRY_COUNT"
+  old_request_timeout="$REQUEST_TIMEOUT"
+  PATH="$mock_bin:$PATH"
+  HOME="$home_dir"
+  export XDG_CACHE_HOME="$cache_home"
+  CACHE_DIR="$cache_home/claude-codex-usage"
+  LOCK_DIR="$CACHE_DIR/locks"
+  TMP_DIR="$CACHE_DIR/tmp"
+  CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
+  NOTIFY_STATE="$CACHE_DIR/notify-state.json"
+  RETRY_COUNT=0
+  REQUEST_TIMEOUT=15
+  mkdir -p "$CACHE_DIR" "$LOCK_DIR" "$TMP_DIR"
+  now="$(date '+%s')"
+  jq -cn --argjson now "$now" '{schema_version:1,service:"claude",fetched_at:$now,updated_at:$now,five_hour:{used_percent:50,resets_at_epoch:null},seven_day:{used_percent:10,resets_at_epoch:null},last_error:null}' >"$CLAUDE_CACHE"
+  MOCK_CURL_CALLED_FILE="$tmp/mock-invalid-token-curl-called"
+  export MOCK_CURL_CALLED_FILE
+  : >"$MOCK_CURL_CALLED_FILE"
+
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"bad\nline"}}' >"$home_dir/.claude/.credentials.json"
+  refresh_service claude >/dev/null 2>&1
+  assert_eq "LF token writes auth error type" "auth" "$(jq -r '.last_error.type' "$CLAUDE_CACHE")"
+  out="$("$ROOT/tmux-usage.sh" 120)"
+  assert_contains "LF token tmux shows ERR" "$out" "ERR"
+  assert_eq "LF token does not call curl" "0" "$(wc -l <"$MOCK_CURL_CALLED_FILE" | tr -d ' ')"
+  assert_eq "LF token does not create curl config" "0" "$(find "$TMP_DIR" -type f -name '.claude-curl-auth.*.conf' | wc -l | tr -d ' ')"
+
+  printf '%s\n' '{"claudeAiOauth":{"accessToken":"bad\rline"}}' >"$home_dir/.claude/.credentials.json"
+  err_file="$tmp/invalid-token-cr.err"
+  out_file="$tmp/invalid-token-cr.out"
+  fetch_claude_once "$out_file" "$err_file" >/dev/null 2>&1
+  status=$?
+  assert_eq "CR token fetch returns auth status" "10" "$status"
+  assert_eq "CR token uses safe error token" "invalid_token" "$(cat "$err_file")"
+  assert_eq "invalid_token is safe for logs" "invalid_token" "$(safe_error_token "$err_file")"
+  assert_eq "CR token does not call curl" "0" "$(wc -l <"$MOCK_CURL_CALLED_FILE" | tr -d ' ')"
+
+  PATH="$old_path"
+  HOME="$old_home"
+  if [ -n "$old_xdg_cache_home" ]; then
+    export XDG_CACHE_HOME="$old_xdg_cache_home"
+  else
+    unset XDG_CACHE_HOME
+  fi
+  CACHE_DIR="$old_cache_dir"
+  LOCK_DIR="$old_lock_dir"
+  TMP_DIR="$old_tmp_dir"
+  CLAUDE_CACHE="$old_claude_cache"
+  NOTIFY_STATE="$old_notify_state"
+  RETRY_COUNT="$old_retry_count"
+  REQUEST_TIMEOUT="$old_request_timeout"
+  unset MOCK_CURL_CALLED_FILE
 }
 
 test_failure_update() {
@@ -554,6 +677,7 @@ test_syntax() {
 }
 
 test_lock_cleanup_trap
+test_stale_lock_can_be_reacquired
 test_invalid_numeric_config_fallback
 test_uninstall_purge_cache_guard
 test_uninstall_purge_cache_canonical_guard
@@ -562,6 +686,7 @@ test_json_transform
 test_usage_payload_validation
 test_parse_failure_cache
 test_fetch_claude_auth_uses_curl_config
+test_fetch_claude_rejects_crlf_token
 test_sanitized_fetch_logging
 test_failure_update
 test_transient_refresh_failures
