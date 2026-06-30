@@ -41,6 +41,3 @@ CELLS="${CELLS:-8}"
 
 # Show stale marker when fetched_at is older than this many minutes.
 STALE_MINUTES="${STALE_MINUTES:-10}"
-
-# Cache age threshold used by refresh.sh for sleep-resume freshness policy.
-SLEEP_STALE_MINUTES="${SLEEP_STALE_MINUTES:-5}"

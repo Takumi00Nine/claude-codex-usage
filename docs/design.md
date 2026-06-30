@@ -303,7 +303,6 @@ refresh.sh all
 | `NOTIFY_SOUND` | `Ping` | `osascript` 通知サウンド |
 | `RESET_HOOK` | 空 | リセット通知後に呼ぶ外部スクリプト |
 | `HOOK_TIMEOUT` | `60` | `RESET_HOOK` 実行のタイムアウト秒 |
-| `SLEEP_STALE_MINUTES` | `5` | スリープ復帰相当の stale 判定 |
 | `XDG_CONFIG_HOME` | `$HOME/.config` | 設定ディレクトリ上書き |
 | `XDG_CACHE_HOME` | `$HOME/.cache` | キャッシュディレクトリ上書き |
 
@@ -429,7 +428,7 @@ uninstall.sh --purge-cache
 
 1. `launchctl bootout gui/$(id -u)/com.claude-codex-usage.refresh` を試行。
 2. `~/Library/LaunchAgents/com.claude-codex-usage.refresh.plist` を削除。
-3. `--purge-cache` 指定時のみ `~/.cache/claude-codex-usage/` を削除。
+3. `--purge-cache` 指定時のみ `~/.cache/claude-codex-usage/` を削除する。削除前に対象パスを表示し、空文字・`/`・`$HOME`・`$HOME` 直下の浅いパス・末尾が `claude-codex-usage` でないパスは拒否する。
 4. `~/.config/claude-codex-usage/config.sh` は削除しない。
 
 終了コード:
@@ -491,7 +490,7 @@ uninstall.sh --purge-cache
 - `RunAtLoad` でロード直後に1回取得する。
 - `StartCalendarInterval` でカレンダー時刻に起動する。
 - macOS のスリープ中に逃したカレンダー実行は復帰後にまとめて扱われるため、復帰直後の `refresh.sh all` 起動を期待できる。
-- 念のため `refresh.sh` は起動時に `fetched_at` を見て `SLEEP_STALE_MINUTES` 超なら通常取得を行う。通常の1分起動でも同じコードパスを使う。
+- `refresh.sh` は起動のたびに通常取得を行う単一エントリポイントである。launchd の wake coalesce 発火と合わせて、別閾値なしでスリープ復帰後の即時更新要件を満たす。旧 `SLEEP_STALE_MINUTES` は廃止済み。
 - `StartInterval` は使わない。要件の coalesce 方針を優先する。
 
 ## 6. タイムアウト・リトライ実装方針
@@ -502,7 +501,7 @@ uninstall.sh --purge-cache
 - HTTP は `curl --max-time "$REQUEST_TIMEOUT"` で制限する。
 - `codex app-server`、`osascript`、`RESET_HOOK` はサブシェルと watchdog で制限する。
 - リトライは初回 + `RETRY_COUNT` 回。`RETRY_COUNT=2` なら最大3回。
-- 429 は指数バックオフ、その他は短い固定バックオフにする。
+- 429 は追加リトライせず次回更新まで待つ。その他のリトライ対象失敗は 1 秒の固定バックオフにする。指数バックオフは現行実装では廃止する。
 
 ### 6.2 Claude トークン取得と API 呼び出し
 
@@ -529,7 +528,7 @@ curl -sS --max-time "$REQUEST_TIMEOUT" \
   "https://api.anthropic.com/api/oauth/usage"
 ```
 
-HTTP body と status を分離して、2xx 以外は `last_error.type="http"` にする。429 の場合は `sleep 1, 2, 4...` の指数バックオフを行う。ただし各 sleep は最大30秒に丸める。
+HTTP body と status を分離して、2xx 以外は `last_error.type="http"` にする。429 の場合は一過性失敗として扱い、直前キャッシュを維持して追加リトライを行わない。
 
 ### 6.3 汎用コマンドタイムアウト
 
@@ -537,10 +536,24 @@ bash 3.2 互換で外部コマンドを制限する。
 
 ```bash
 run_with_timeout() {
-  local seconds flag child watcher status
+  local seconds timeout_base timeout_dir flag child watcher status i
   seconds="$1"
   shift
-  flag="${TMPDIR:-/tmp}/claude-codex-timeout.$$.$RANDOM"
+  timeout_base="${TMP_DIR:-${TMPDIR:-/tmp}}"
+  mkdir -p "$timeout_base" 2>/dev/null || timeout_base="${TMPDIR:-/tmp}"
+  timeout_dir=""
+  i=0
+  while [ "$i" -lt 10 ]; do
+    timeout_dir="$timeout_base/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null && break
+    timeout_dir=""
+    i=$(( i + 1 ))
+  done
+  if [ -z "$timeout_dir" ]; then
+    timeout_dir="${TMPDIR:-/tmp}/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null || return 1
+  fi
+  flag="$timeout_dir/flag"
   "$@" &
   child=$!
   (
@@ -558,15 +571,15 @@ run_with_timeout() {
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   if [ -f "$flag" ]; then
-    rm -f "$flag" 2>/dev/null
+    rm -rf "$timeout_dir" 2>/dev/null
     return 124
   fi
-  rm -f "$flag" 2>/dev/null
+  rm -rf "$timeout_dir" 2>/dev/null
   return "$status"
 }
 ```
 
-タイムアウト時の終了コードは 124（GNU `timeout` と同じ値）。フラグファイルでタイムアウト判定するため、`child` がゼロ以外で終了した場合でも正確に区別できる。呼び出し側は `[ $? -eq 124 ]` で `last_error.type="timeout"` に分岐する。
+タイムアウト時の終了コードは 124（GNU `timeout` と同じ値）。`TMP_DIR` 配下のユニークな一時ディレクトリ内に置くフラグファイルでタイムアウト判定するため、`child` がゼロ以外で終了した場合でも正確に区別できる。呼び出し側は `[ $? -eq 124 ]` で `last_error.type="timeout"` に分岐する。
 
 子プロセスがさらに子を作る可能性がある `codex app-server` では、後述の接続管理で個別に `kill` と `wait` を行う。
 
@@ -582,18 +595,16 @@ while [ "$attempt" -lt "$max_attempts" ]; do
   fi
 
   [ "$attempt" -lt "$max_attempts" ] || break
-  if [ "$last_status" = "429" ]; then
-    sleep_seconds=$(( 1 << (attempt - 1) ))
-    [ "$sleep_seconds" -gt 30 ] && sleep_seconds=30
-  else
-    sleep_seconds=1
+  if [ "$last_status" = "42" ]; then
+    break
   fi
+  sleep_seconds=1
   sleep "$sleep_seconds"
 done
 return 1
 ```
 
-bash 3.2 互換のビットシフト `1 << n` で指数バックオフを実現する（`**` 演算子は bash 4.0 以降のため使用しない）。
+429 は HTTP レート制限を終了コード 42 として扱い、その更新サイクル内の追加リトライを抑止する。その他のリトライ対象失敗は bash 3.2 互換の固定 1 秒 sleep を使う。
 
 ## 7. 通知ステートマシン
 
@@ -789,7 +800,7 @@ done
 
 ### 8.3 タイムアウト時の掃除
 
-`cleanup_codex_server` 関数がグローバル変数を参照する。`trap` で `main` の先頭に登録し、シグナル受信時でもプロセスリークしない。
+`cleanup_codex_server` と `cleanup_locks` 関数がグローバル変数を参照する。`trap` で `main` の先頭に登録し、シグナル受信時でもプロセスリークとロック残存を防ぐ。
 
 ```bash
 cleanup_codex_server() {
@@ -799,10 +810,18 @@ cleanup_codex_server() {
   [ -n "$_codex_tmp_dir" ]    && rm -rf "$_codex_tmp_dir" 2>/dev/null
 }
 
+cleanup_locks() {
+  local lock
+  printf '%s\n' "$_held_locks" | while IFS= read lock; do
+    [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+  done
+  _held_locks=""
+}
+
 # main() の先頭で登録する
-trap 'cleanup_codex_server; exit 130' INT    # Ctrl+C (128+2)
-trap 'cleanup_codex_server; exit 143' TERM   # kill (128+15)
-trap 'cleanup_codex_server'           EXIT   # 通常終了・上記シグナル後の共通後処理
+trap 'cleanup_locks; cleanup_codex_server; exit 130' INT    # Ctrl+C (128+2)
+trap 'cleanup_locks; cleanup_codex_server; exit 143' TERM   # kill (128+15)
+trap 'cleanup_locks; cleanup_codex_server'           EXIT   # 通常終了・上記シグナル後の共通後処理
 ```
 
 `codex app-server` が SIGTERM を無視した場合は `kill -9` にフォールバックする。

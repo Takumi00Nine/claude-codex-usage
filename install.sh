@@ -4,6 +4,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 LABEL="com.claude-codex-usage.refresh"
 
 load_config() {
+  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-codex-usage"
+  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
+  LOG_DIR="$HOME/Library/Logs/claude-codex-usage"
+  LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
+  PLIST_PATH="$LAUNCHAGENT_DIR/$LABEL.plist"
+  CONFIG_FILE="$CONFIG_DIR/config.sh"
+  if [ -f "$CONFIG_FILE" ]; then
+    . "$CONFIG_FILE"
+  fi
   REFRESH_INTERVAL="${REFRESH_INTERVAL:-60}"
   REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-15}"
   RETRY_COUNT="${RETRY_COUNT:-2}"
@@ -16,28 +25,70 @@ load_config() {
   USAGE_NARROW_BELOW="${USAGE_NARROW_BELOW:-100}"
   CELLS="${CELLS:-8}"
   STALE_MINUTES="${STALE_MINUTES:-10}"
-  SLEEP_STALE_MINUTES="${SLEEP_STALE_MINUTES:-5}"
-  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-codex-usage"
-  CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
-  LOG_DIR="$HOME/Library/Logs/claude-codex-usage"
-  LAUNCHAGENT_DIR="$HOME/Library/LaunchAgents"
-  PLIST_PATH="$LAUNCHAGENT_DIR/$LABEL.plist"
-  CONFIG_FILE="$CONFIG_DIR/config.sh"
-  if [ -f "$CONFIG_FILE" ]; then
-    . "$CONFIG_FILE"
-  fi
+  validate_config_numbers
 }
 
 xml_escape() {
-  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+  local value
+  value="$1"
+  printf '%s' "$value" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'
+}
+
+config_log() {
+  printf '%s\n' "$*" >&2
+}
+
+is_unsigned_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+config_fallback() {
+  local name default reason
+  name="$1"
+  default="$2"
+  reason="$3"
+  config_log "config: $name invalid ($reason); using default $default"
+  eval "$name=\$default"
+}
+
+normalize_int_config() {
+  local name default min max value
+  name="$1"
+  default="$2"
+  min="$3"
+  max="$4"
+  eval "value=\"\${$name}\""
+  is_unsigned_int "$value" || { config_fallback "$name" "$default" "not an integer"; return; }
+  [ "$value" -ge "$min" ] || { config_fallback "$name" "$default" "below $min"; return; }
+  if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+    config_fallback "$name" "$default" "above $max"
+  fi
+}
+
+validate_config_numbers() {
+  normalize_int_config REFRESH_INTERVAL 60 1 ""
+  normalize_int_config REQUEST_TIMEOUT 15 1 ""
+  normalize_int_config RETRY_COUNT 2 0 ""
+  normalize_int_config WARN_THRESHOLD 80 0 100
+  normalize_int_config NOTIFY_THRESHOLD 20 0 100
+  normalize_int_config NOTIFY_FLOOR 5 0 100
+  normalize_int_config HOOK_TIMEOUT 60 1 ""
+  normalize_int_config USAGE_NARROW_BELOW 100 1 ""
+  normalize_int_config CELLS 8 1 ""
+  normalize_int_config STALE_MINUTES 10 1 ""
 }
 
 path_dir() {
+  local command_path
   command_path="$1"
   dirname "$command_path"
 }
 
 append_unique_path() {
+  local item current
   item="$1"
   current="$2"
   case ":$current:" in
@@ -47,6 +98,7 @@ append_unique_path() {
 }
 
 build_path() {
+  local result cmd found dir
   result=""
   for cmd in jq curl codex osascript launchctl; do
     found="$(command -v "$cmd" 2>/dev/null)"
@@ -69,6 +121,7 @@ validate_interval() {
 }
 
 calendar_entries() {
+  local interval step minute
   interval="$1"
   step=$(( interval / 60 ))
   minute=0
@@ -79,6 +132,7 @@ calendar_entries() {
 }
 
 generate_plist() {
+  local refresh_path env_path log_path
   refresh_path="$(xml_escape "$SCRIPT_DIR/refresh.sh")"
   env_path="$(xml_escape "$1")"
   log_path="$(xml_escape "$LOG_DIR/refresh.log")"
@@ -115,6 +169,7 @@ generate_plist() {
 }
 
 write_plist() {
+  local env_path tmp
   env_path="$1"
   tmp="$PLIST_PATH.tmp.$$"
   generate_plist "$env_path" >"$tmp" 2>/dev/null || {
@@ -129,10 +184,14 @@ write_plist() {
 }
 
 check_required() {
+  local missing cmd
   missing=""
-  for cmd in jq curl codex osascript launchctl; do
+  for cmd in jq curl codex osascript; do
     command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
   done
+  if [ "${CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL:-}" != "1" ]; then
+    command -v launchctl >/dev/null 2>&1 || missing="$missing launchctl"
+  fi
   if [ -n "$missing" ]; then
     printf 'missing required command(s):%s\n' "$missing" >&2
     return 1
@@ -141,6 +200,7 @@ check_required() {
 }
 
 main() {
+  local env_path uid
   load_config
   check_required || return 3
   validate_interval || {
@@ -156,10 +216,12 @@ main() {
   write_plist "$env_path" || return 1
   chmod +x "$SCRIPT_DIR/refresh.sh" "$SCRIPT_DIR/tmux-usage.sh" 2>/dev/null
   uid="$(id -u)"
-  launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
-  launchctl bootstrap "gui/$uid" "$PLIST_PATH" >/dev/null 2>&1 || return 4
-  launchctl enable "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
-  launchctl kickstart -k "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
+  if [ "${CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL:-}" != "1" ]; then
+    launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
+    launchctl bootstrap "gui/$uid" "$PLIST_PATH" >/dev/null 2>&1 || return 4
+    launchctl enable "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
+    launchctl kickstart -k "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
+  fi
   printf 'installed %s\n' "$PLIST_PATH"
   return 0
 }

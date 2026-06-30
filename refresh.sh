@@ -20,7 +20,7 @@ load_config() {
   NOTIFY_SOUND="${NOTIFY_SOUND:-Ping}"
   RESET_HOOK="${RESET_HOOK:-}"
   HOOK_TIMEOUT="${HOOK_TIMEOUT:-60}"
-  SLEEP_STALE_MINUTES="${SLEEP_STALE_MINUTES:-5}"
+  validate_config_numbers
   LOCK_DIR="$CACHE_DIR/locks"
   TMP_DIR="$CACHE_DIR/tmp"
   CLAUDE_CACHE="$CACHE_DIR/claude-cache.json"
@@ -32,10 +32,57 @@ log() {
   printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$$" "$*"
 }
 
+is_unsigned_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+config_fallback() {
+  local name default reason
+  name="$1"
+  default="$2"
+  reason="$3"
+  log "config: $name invalid ($reason); using default $default"
+  eval "$name=\$default"
+}
+
+normalize_int_config() {
+  local name default min max value
+  name="$1"
+  default="$2"
+  min="$3"
+  max="$4"
+  eval "value=\"\${$name}\""
+  is_unsigned_int "$value" || { config_fallback "$name" "$default" "not an integer"; return; }
+  [ "$value" -ge "$min" ] || { config_fallback "$name" "$default" "below $min"; return; }
+  if [ -n "$max" ] && [ "$value" -gt "$max" ]; then
+    config_fallback "$name" "$default" "above $max"
+  fi
+}
+
+validate_config_numbers() {
+  normalize_int_config REFRESH_INTERVAL 60 1 ""
+  normalize_int_config REQUEST_TIMEOUT 15 1 ""
+  normalize_int_config RETRY_COUNT 2 0 ""
+  normalize_int_config WARN_THRESHOLD 80 0 100
+  normalize_int_config NOTIFY_THRESHOLD 20 0 100
+  normalize_int_config NOTIFY_FLOOR 5 0 100
+  normalize_int_config HOOK_TIMEOUT 60 1 ""
+}
+
 # Global state for codex server cleanup (set by fetch_codex_once, read by trap handler)
 _codex_server_pid=""
 _codex_writer_pid=""
 _codex_tmp_dir=""
+
+# Global state for lock cleanup (set by with_lock, read by trap handler)
+_held_locks=""
+
+# Global state for Claude curl auth config cleanup (set by fetch_claude_once)
+_claude_curl_config_files=""
+_claude_curl_config_file_result=""
 
 cleanup_codex_server() {
   [ -n "$_codex_writer_pid" ] && kill "$_codex_writer_pid" 2>/dev/null
@@ -44,11 +91,28 @@ cleanup_codex_server() {
   [ -n "$_codex_tmp_dir" ]    && rm -rf "$_codex_tmp_dir" 2>/dev/null
 }
 
+cleanup_claude_curl_configs() {
+  local file
+  printf '%s\n' "$_claude_curl_config_files" | while IFS= read file; do
+    [ -n "$file" ] && rm -f "$file" 2>/dev/null
+  done
+  _claude_curl_config_files=""
+}
+
+cleanup_locks() {
+  local lock
+  printf '%s\n' "$_held_locks" | while IFS= read lock; do
+    [ -n "$lock" ] && rm -rf "$lock" 2>/dev/null
+  done
+  _held_locks=""
+}
+
 now_epoch() {
   date -u '+%s'
 }
 
 iso_to_epoch() {
+  local value normalized
   value="$1"
   [ -n "$value" ] && [ "$value" != "null" ] || return 1
   normalized="$(printf '%s' "$value" | sed -E 's/\.[0-9]+([+-][0-9]{2}:[0-9]{2}|Z)$/\1/; s/Z$/+0000/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/' 2>/dev/null)"
@@ -77,10 +141,24 @@ atomic_write() {
 }
 
 run_with_timeout() {
-  local seconds flag child watcher status
+  local seconds timeout_base timeout_dir flag child watcher status i
   seconds="$1"
   shift
-  flag="${TMPDIR:-/tmp}/claude-codex-timeout.$$.$RANDOM"
+  timeout_base="${TMP_DIR:-${TMPDIR:-/tmp}}"
+  mkdir -p "$timeout_base" 2>/dev/null || timeout_base="${TMPDIR:-/tmp}"
+  timeout_dir=""
+  i=0
+  while [ "$i" -lt 10 ]; do
+    timeout_dir="$timeout_base/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null && break
+    timeout_dir=""
+    i=$(( i + 1 ))
+  done
+  if [ -z "$timeout_dir" ]; then
+    timeout_dir="${TMPDIR:-/tmp}/.claude-codex-timeout.$$.$RANDOM.d"
+    mkdir "$timeout_dir" 2>/dev/null || return 1
+  fi
+  flag="$timeout_dir/flag"
   "$@" &
   child=$!
   (
@@ -98,11 +176,34 @@ run_with_timeout() {
   kill "$watcher" 2>/dev/null
   wait "$watcher" 2>/dev/null
   if [ -f "$flag" ]; then
-    rm -f "$flag" 2>/dev/null
+    rm -rf "$timeout_dir" 2>/dev/null
     return 124
   fi
-  rm -f "$flag" 2>/dev/null
+  rm -rf "$timeout_dir" 2>/dev/null
   return "$status"
+}
+
+is_transient_fetch_status() {
+  case "$1" in
+    42|124|5|6|7|28|52|55|56) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+safe_error_token() {
+  local value
+  value="$(cat "$1" 2>/dev/null | tail -n 1)"
+  case "$value" in
+    http_status=[0-9][0-9][0-9]) printf '%s' "$value"; return 0 ;;
+    curl_exit=[0-9]|curl_exit=[0-9][0-9]|curl_exit=[0-9][0-9][0-9]) printf '%s' "$value"; return 0 ;;
+    rate_limited) printf '%s' "$value"; return 0 ;;
+    missing_token) printf '%s' "$value"; return 0 ;;
+    invalid_token) printf '%s' "$value"; return 0 ;;
+    parse_error) printf '%s' "$value"; return 0 ;;
+    codex_timeout) printf '%s' "$value"; return 0 ;;
+    codex_unavailable) printf '%s' "$value"; return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 lock_max_age() {
@@ -110,6 +211,7 @@ lock_max_age() {
 }
 
 with_lock() {
+  local name lock created now max_age status previous_held_locks
   name="$1"
   shift
   mkdir -p "$LOCK_DIR" "$TMP_DIR" 2>/dev/null || return 1
@@ -124,15 +226,24 @@ with_lock() {
     esac
     mkdir "$lock" 2>/dev/null || { log "$name: lock held, skipping"; return 0; }
   fi
+  previous_held_locks="$_held_locks"
+  if [ -n "$_held_locks" ]; then
+    _held_locks="$_held_locks
+$lock"
+  else
+    _held_locks="$lock"
+  fi
   printf '%s\n' "$$" >"$lock/pid" 2>/dev/null
   now_epoch >"$lock/created_at" 2>/dev/null
   "$@"
   status=$?
   rm -rf "$lock" 2>/dev/null
+  _held_locks="$previous_held_locks"
   return "$status"
 }
 
 empty_error_cache() {
+  local service now type message status attempts
   service="$1"
   now="$2"
   type="$3"
@@ -179,6 +290,7 @@ write_failure_cache() {
 }
 
 transform_claude_usage() {
+  local raw now fh_reset sd_reset fh_epoch sd_epoch value
   raw="$1"
   now="$2"
   fh_reset="$(printf '%s' "$raw" | jq -r '.five_hour.resets_at // .five_hour.resetsAt // empty' 2>/dev/null)"
@@ -215,6 +327,7 @@ transform_claude_usage() {
 }
 
 transform_codex_usage() {
+  local raw now
   raw="$1"
   now="$2"
   printf '%s' "$raw" | jq -c --argjson now "$now" '
@@ -236,7 +349,99 @@ transform_codex_usage() {
     }' 2>/dev/null
 }
 
+validate_usage_payload() {
+  local service payload
+  service="$1"
+  payload="$2"
+  printf '%s' "$payload" | jq -e --arg service "$service" '
+    .schema_version == 1
+    and .service == $service
+    and (.five_hour.used_percent | type == "number" and . >= 0 and . <= 100)
+    and (.seven_day.used_percent | type == "number" and . >= 0 and . <= 100)
+  ' >/dev/null 2>&1
+}
+
+write_validated_usage_payload() {
+  local service payload out_file err_file
+  service="$1"
+  payload="$2"
+  out_file="$3"
+  err_file="$4"
+  validate_usage_payload "$service" "$payload" || {
+    printf '%s\n' 'parse_error' >"$err_file"
+    return 11
+  }
+  printf '%s\n' "$payload" >"$out_file"
+}
+
+curl_config_quote() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+token_has_crlf() {
+  case "$1" in
+    *$'\r'*|*$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+register_claude_curl_config() {
+  local file
+  file="$1"
+  if [ -n "$_claude_curl_config_files" ]; then
+    _claude_curl_config_files="$_claude_curl_config_files
+$file"
+  else
+    _claude_curl_config_files="$file"
+  fi
+}
+
+create_claude_curl_config() {
+  local token file quoted i
+  token="$1"
+  _claude_curl_config_file_result=""
+  mkdir -p "$TMP_DIR" 2>/dev/null || return 1
+  i=0
+  while [ "$i" -lt 10 ]; do
+    file="$TMP_DIR/.claude-curl-auth.$$.$RANDOM.conf"
+    if ( set -C; umask 077; : >"$file" ) 2>/dev/null; then
+      chmod 600 "$file" 2>/dev/null || { rm -f "$file" 2>/dev/null; return 1; }
+      register_claude_curl_config "$file"
+      quoted="$(curl_config_quote "$token")"
+      printf 'header = "Authorization: Bearer %s"\n' "$quoted" >"$file" 2>/dev/null || {
+        rm -f "$file" 2>/dev/null
+        return 1
+      }
+      _claude_curl_config_file_result="$file"
+      return 0
+    fi
+    i=$(( i + 1 ))
+  done
+  return 1
+}
+
+remove_claude_curl_config() {
+  local file kept entry
+  file="$1"
+  rm -f "$file" 2>/dev/null
+  kept=""
+  while IFS= read entry; do
+    [ -n "$entry" ] || continue
+    [ "$entry" = "$file" ] && continue
+    if [ -n "$kept" ]; then
+      kept="$kept
+$entry"
+    else
+      kept="$entry"
+    fi
+  done <<EOF
+$_claude_curl_config_files
+EOF
+  _claude_curl_config_files="$kept"
+}
+
 fetch_claude_once() {
+  local out_file err_file token response curl_status status body now transformed curl_config
   out_file="$1"
   err_file="$2"
   token="$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null \
@@ -246,31 +451,48 @@ fetch_claude_once() {
       "$HOME/.claude/.credentials.json" 2>/dev/null)"
   fi
   if [ -z "$token" ]; then
-    printf '%s\n' 'missing Claude token in keychain or credentials file' >"$err_file"
+    printf '%s\n' 'missing_token' >"$err_file"
     return 10
   fi
+  if token_has_crlf "$token"; then
+    printf '%s\n' 'invalid_token' >"$err_file"
+    return 10
+  fi
+  create_claude_curl_config "$token" || {
+    printf '%s\n' 'curl_config_error' >"$err_file"
+    return 13
+  }
+  curl_config="$_claude_curl_config_file_result"
   response="$(curl -sS --max-time "$REQUEST_TIMEOUT" \
     -w '\n%{http_code}' \
-    -H "Authorization: Bearer $token" \
+    --config "$curl_config" \
     -H "anthropic-beta: oauth-2025-04-20" \
-    "https://api.anthropic.com/api/oauth/usage" 2>"$err_file")"
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)"
   curl_status=$?
-  [ "$curl_status" -eq 0 ] || return "$curl_status"
+  remove_claude_curl_config "$curl_config"
+  if [ "$curl_status" -ne 0 ]; then
+    printf 'curl_exit=%s\n' "$curl_status" >"$err_file"
+    return "$curl_status"
+  fi
   status="$(printf '%s\n' "$response" | tail -n 1)"
   body="$(printf '%s\n' "$response" | sed '$d')"
   case "$status" in
     2??)
       now="$(now_epoch)"
-      transformed="$(transform_claude_usage "$body" "$now")" || return 11
-      printf '%s\n' "$transformed" >"$out_file"
+      transformed="$(transform_claude_usage "$body" "$now")" || {
+        printf '%s\n' 'parse_error' >"$err_file"
+        return 11
+      }
+      write_validated_usage_payload claude "$transformed" "$out_file" "$err_file" || return 11
       return 0
       ;;
-    429) printf '%s\n' "$status" >"$err_file"; return 42 ;;
-    *) printf '%s\n' "$status" >"$err_file"; return 12 ;;
+    429) printf '%s\n' 'rate_limited' >"$err_file"; return 42 ;;
+    *) printf 'http_status=%s\n' "$status" >"$err_file"; return 12 ;;
   esac
 }
 
 fetch_codex_once() {
+  local out_file err_file in_fifo server_out server_err codex_deadline start_seconds result now transformed
   out_file="$1"
   err_file="$2"
   _codex_tmp_dir="$TMP_DIR/codex.$$.$RANDOM"
@@ -314,24 +536,30 @@ fetch_codex_once() {
   wait "$_codex_writer_pid" 2>/dev/null
   wait "$_codex_server_pid" 2>/dev/null
   if [ -z "$result" ]; then
-    cat "$server_err" >"$err_file" 2>/dev/null
+    printf '%s\n' 'codex_timeout' >"$err_file"
     rm -rf "$_codex_tmp_dir" 2>/dev/null
     _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
     return 124
   fi
   now="$(now_epoch)"
   transformed="$(transform_codex_usage "$result" "$now")" || {
+    printf '%s\n' 'parse_error' >"$err_file"
     rm -rf "$_codex_tmp_dir" 2>/dev/null
     _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
     return 11
   }
-  printf '%s\n' "$transformed" >"$out_file"
+  write_validated_usage_payload codex "$transformed" "$out_file" "$err_file" || {
+    rm -rf "$_codex_tmp_dir" 2>/dev/null
+    _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
+    return 11
+  }
   rm -rf "$_codex_tmp_dir" 2>/dev/null
   _codex_tmp_dir="" _codex_server_pid="" _codex_writer_pid=""
   return 0
 }
 
 retry_fetch() {
+  local service out_file err_file attempt max_attempts last_status err_detail sleep_seconds
   service="$1"
   out_file="$2"
   err_file="$3"
@@ -350,15 +578,14 @@ retry_fetch() {
       log "$service: fetch OK (attempt $attempt/$max_attempts)"
       return 0
     fi
-    err_detail="$(cat "$err_file" 2>/dev/null | head -1)"
-    log "$service: fetch FAILED status=$last_status attempt=$attempt/$max_attempts${err_detail:+ ($err_detail)}"
-    [ "$attempt" -lt "$max_attempts" ] || break
+    err_detail="$(safe_error_token "$err_file")"
+    log "$service: fetch FAILED status=$last_status attempt=$attempt/$max_attempts${err_detail:+ token=$err_detail}"
     if [ "$last_status" -eq 42 ]; then
-      sleep_seconds=$(( 1 << (attempt - 1) ))
-      [ "$sleep_seconds" -gt 30 ] && sleep_seconds=30
-    else
-      sleep_seconds=1
+      log "$service: rate limited; retry suppressed until next refresh cycle"
+      break
     fi
+    [ "$attempt" -lt "$max_attempts" ] || break
+    sleep_seconds=1
     log "$service: retry in ${sleep_seconds}s"
     sleep "$sleep_seconds"
   done
@@ -391,6 +618,7 @@ read_notify_state() {
 }
 
 send_notification() {
+  local message
   message="$1"
   if [ -n "${CLAUDE_CODEX_USAGE_TEST_NOTIFY_LOG:-}" ]; then
     printf '%s\n' "$message" >>"$CLAUDE_CODEX_USAGE_TEST_NOTIFY_LOG"
@@ -405,6 +633,7 @@ send_notification() {
 }
 
 run_reset_hook() {
+  local service window prev current
   service="$1"
   window="$2"
   prev="$3"
@@ -416,6 +645,7 @@ run_reset_hook() {
 }
 
 process_notifications() {
+  local service cache state now cache_json events kind window a b display_service display_window updated
   service="$1"
   cache="$2"
   [ -f "$cache" ] || return 0
@@ -497,6 +727,7 @@ process_notifications() {
 }
 
 refresh_service() {
+  local service cache out err fetch_status attempts payload error_type message status_json
   service="$1"
   if [ "$service" = "claude" ]; then
     cache="$CLAUDE_CACHE"
@@ -519,15 +750,20 @@ refresh_service() {
     with_lock notify process_notifications "$service" "$cache"
     return 0
   fi
+  if is_transient_fetch_status "$fetch_status"; then
+    log "$service: transient fetch failure; keeping existing cache"
+    rm -f "$out" "$err" 2>/dev/null
+    return 0
+  fi
   case "$fetch_status" in
     10) error_type="auth"; message="authentication failed"; status_json="null" ;;
     11) error_type="parse"; message="failed to parse usage response"; status_json="null" ;;
-    12) error_type="http"; message="HTTP request failed"; status_json="$(cat "$err" 2>/dev/null | tail -n 1)";;
+    12) error_type="http"; message="HTTP request failed"; status_json="$(safe_error_token "$err" | sed 's/^http_status=//')" ;;
     42) error_type="http"; message="rate limited"; status_json="429" ;;
     124) error_type="timeout"; message="request timed out"; status_json="null" ;;
     *) error_type="command"; message="usage command failed"; status_json="null" ;;
   esac
-  case "$status_json" in ''|*[!0-9]*) status_json="null" ;; esac
+  case "$status_json" in [1-9][0-9][0-9]) ;; *) status_json="null" ;; esac
   write_failure_cache "$service" "$cache" "$error_type" "$message" "$status_json" "$attempts"
   rm -f "$out" "$err" 2>/dev/null
   return 0
@@ -535,9 +771,10 @@ refresh_service() {
 
 main() {
   load_config
-  trap 'cleanup_codex_server; exit 130' INT
-  trap 'cleanup_codex_server; exit 143' TERM
-  trap 'cleanup_codex_server'           EXIT
+  local mode
+  trap 'cleanup_locks; cleanup_claude_curl_configs; cleanup_codex_server; exit 130' INT
+  trap 'cleanup_locks; cleanup_claude_curl_configs; cleanup_codex_server; exit 143' TERM
+  trap 'cleanup_locks; cleanup_claude_curl_configs; cleanup_codex_server'           EXIT
   mode="${1:-all}"
   case "$mode" in
     claude|codex|all) ;;

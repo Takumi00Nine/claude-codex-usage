@@ -13,7 +13,111 @@ load_config() {
   fi
 }
 
+normalize_path_no_trailing_slash() {
+  local path
+  path="$1"
+  while [ "$path" != "/" ]; do
+    case "$path" in
+      */) path="${path%/}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$path"
+}
+
+canonicalize_existing_or_parent() {
+  local path parent base canonical_parent
+  path="$(normalize_path_no_trailing_slash "$1")"
+  [ -n "$path" ] || return 1
+  if [ -e "$path" ]; then
+    ( cd "$path" 2>/dev/null && pwd -P ) || return 1
+    return 0
+  fi
+  parent="$(dirname "$path")"
+  base="$(basename "$path")"
+  canonical_parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+  if [ "$canonical_parent" = "/" ]; then
+    printf '/%s\n' "$base"
+  else
+    printf '%s/%s\n' "$canonical_parent" "$base"
+  fi
+}
+
+path_owner_uid() {
+  stat -f '%u' "$1" 2>/dev/null || stat -c '%u' "$1" 2>/dev/null
+}
+
+validate_purge_cache_dir() {
+  local target home rest default_cache_root allowed_root allowed_owner uid
+  target="$(canonicalize_existing_or_parent "$CACHE_DIR")" || {
+    printf 'refusing to purge unresolved cache dir: %s\n' "${CACHE_DIR:-<empty>}" >&2
+    return 1
+  }
+  target="$(normalize_path_no_trailing_slash "$target")"
+  home="$(canonicalize_existing_or_parent "$HOME")" || {
+    printf 'refusing to purge unresolved HOME: %s\n' "${HOME:-<empty>}" >&2
+    return 1
+  }
+  home="$(normalize_path_no_trailing_slash "$home")"
+  default_cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-codex-usage"
+  allowed_root="$(canonicalize_existing_or_parent "$default_cache_root")" || {
+    printf 'refusing to purge unresolved cache root: %s\n' "$default_cache_root" >&2
+    return 1
+  }
+  allowed_root="$(normalize_path_no_trailing_slash "$allowed_root")"
+  if [ -e "$allowed_root" ]; then
+    uid="$(id -u)"
+    allowed_owner="$(path_owner_uid "$allowed_root")" || {
+      printf 'refusing to purge cache root with unknown owner: %s\n' "$allowed_root" >&2
+      return 1
+    }
+    if [ "$allowed_owner" != "$uid" ]; then
+      printf 'refusing to purge cache root owned by uid %s: %s\n' "$allowed_owner" "$allowed_root" >&2
+      return 1
+    fi
+  fi
+  case "$target" in
+    ""|"/")
+      printf 'refusing to purge unsafe cache dir: %s\n' "${target:-<empty>}" >&2
+      return 1
+      ;;
+  esac
+  if [ "$target" = "$home" ]; then
+    printf 'refusing to purge unsafe cache dir: %s\n' "$target" >&2
+    return 1
+  fi
+  case "$target" in
+    "$home"/*)
+      rest="${target#$home/}"
+      case "$rest" in
+        */*) ;;
+        *)
+          printf 'refusing to purge shallow HOME path: %s\n' "$target" >&2
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+  case "$target" in
+    "$allowed_root"|"$allowed_root"/*) ;;
+    *)
+      printf 'refusing to purge cache dir outside allowed root: %s\n' "$target" >&2
+      return 1
+      ;;
+  esac
+  case "$target" in
+    */claude-codex-usage) ;;
+    *)
+      printf 'refusing to purge unexpected cache dir: %s\n' "$target" >&2
+      return 1
+      ;;
+  esac
+  CACHE_DIR="$target"
+  return 0
+}
+
 main() {
+  local purge uid purge_target
   purge=0
   case "${1:-}" in
     "") ;;
@@ -22,7 +126,7 @@ main() {
   esac
   load_config
   uid="$(id -u)"
-  if command -v launchctl >/dev/null 2>&1; then
+  if [ "${CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL:-}" != "1" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
   fi
   if [ -e "$PLIST_PATH" ]; then
@@ -32,10 +136,26 @@ main() {
     printf 'plist not found: %s\n' "$PLIST_PATH"
   fi
   if [ "$purge" -eq 1 ]; then
+    validate_purge_cache_dir || return 2
+    purge_target="$CACHE_DIR"
+    if [ -n "${CLAUDE_CODEX_USAGE_TEST_PURGE_SWAP_HOOK:-}" ]; then
+      "$CLAUDE_CODEX_USAGE_TEST_PURGE_SWAP_HOOK" || return 2
+    fi
+    validate_purge_cache_dir || return 2
+    if [ "$CACHE_DIR" != "$purge_target" ]; then
+      printf 'refusing to purge cache dir changed during validation: %s -> %s\n' "$purge_target" "$CACHE_DIR" >&2
+      return 2
+    fi
+    printf 'purging cache dir: %s\n' "$CACHE_DIR"
     rm -rf "$CACHE_DIR" 2>/dev/null || return 1
     printf 'removed %s\n' "$CACHE_DIR"
   fi
   return 0
 }
 
-main "$@"
+if [ "${CLAUDE_CODEX_USAGE_TEST_LIB:-}" = "1" ]; then
+  load_config
+else
+  main "$@"
+  exit $?
+fi
