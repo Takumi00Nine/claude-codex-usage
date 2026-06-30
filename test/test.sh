@@ -51,6 +51,23 @@ assert_not_contains() {
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/ccu-test.XXXXXX")" || exit 1
 trap 'rm -rf "$tmp"' EXIT
+stub_bin="$tmp/bin"
+launchctl_log="$tmp/launchctl.log"
+mkdir -p "$stub_bin" || exit 1
+cat >"$stub_bin/launchctl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CLAUDE_CODEX_USAGE_LAUNCHCTL_LOG"
+exit 0
+EOF
+chmod +x "$stub_bin/launchctl"
+
+run_with_stubbed_launchctl() {
+  CLAUDE_CODEX_USAGE_LAUNCHCTL_LOG="$launchctl_log" PATH="$stub_bin:$PATH" "$@"
+}
+
+run_with_launchctl_skip() {
+  CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL=1 CLAUDE_CODEX_USAGE_LAUNCHCTL_LOG="$launchctl_log" PATH="$stub_bin:$PATH" "$@"
+}
 
 export XDG_CONFIG_HOME="$tmp/config"
 export XDG_CACHE_HOME="$tmp/cache"
@@ -126,7 +143,8 @@ test_uninstall_purge_cache_guard() {
   dangerous="$home_dir/claude-codex-usage"
   mkdir -p "$dangerous"
   printf '%s\n' "CACHE_DIR=\"$dangerous\"" >"$cfg_home/claude-codex-usage/config.sh"
-  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  : >"$launchctl_log"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" run_with_launchctl_skip "$ROOT/uninstall.sh" --purge-cache 2>&1)"
   status=$?
   assert_eq "purge-cache dangerous path rejected status" "2" "$status"
   assert_contains "purge-cache dangerous path rejected message" "$out" "refusing to purge"
@@ -135,6 +153,7 @@ test_uninstall_purge_cache_guard() {
   else
     not_ok "purge-cache leaves dangerous path intact"
   fi
+  assert_eq "purge-cache skip prevents launchctl calls" "0" "$(wc -l <"$launchctl_log" | tr -d ' ')"
 }
 
 test_uninstall_purge_cache_canonical_guard() {
@@ -146,18 +165,36 @@ test_uninstall_purge_cache_canonical_guard() {
   mkdir -p "$home_dir/Library/LaunchAgents" "$cfg_home/claude-codex-usage" "$allowed" "$outside"
 
   printf '%s\n' "CACHE_DIR=\"$cache_home/claude-codex-usage/../../uninstall-outside/claude-codex-usage\"" >"$cfg_home/claude-codex-usage/config.sh"
-  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  : >"$launchctl_log"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" run_with_launchctl_skip "$ROOT/uninstall.sh" --purge-cache 2>&1)"
   status=$?
   assert_eq "purge-cache rejects dot-dot outside root status" "2" "$status"
   assert_contains "purge-cache rejects dot-dot outside root message" "$out" "outside allowed root"
+  assert_eq "purge-cache dot-dot skip prevents launchctl calls" "0" "$(wc -l <"$launchctl_log" | tr -d ' ')"
 
   mkdir -p "$allowed"
   ln -s "$tmp/uninstall-outside" "$allowed/escape"
   printf '%s\n' "CACHE_DIR=\"$allowed/escape/claude-codex-usage\"" >"$cfg_home/claude-codex-usage/config.sh"
-  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" "$ROOT/uninstall.sh" --purge-cache 2>&1)"
+  : >"$launchctl_log"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" run_with_launchctl_skip "$ROOT/uninstall.sh" --purge-cache 2>&1)"
   status=$?
   assert_eq "purge-cache rejects symlink outside root status" "2" "$status"
   assert_contains "purge-cache rejects symlink outside root message" "$out" "outside allowed root"
+  assert_eq "purge-cache symlink skip prevents launchctl calls" "0" "$(wc -l <"$launchctl_log" | tr -d ' ')"
+}
+
+test_uninstall_launchctl_stub() {
+  home_dir="$tmp/uninstall-stub-home"
+  cfg_home="$tmp/uninstall-stub-config"
+  cache_home="$tmp/uninstall-stub-cache"
+  mkdir -p "$home_dir/Library/LaunchAgents" "$cfg_home" "$cache_home"
+  : >"$launchctl_log"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" run_with_stubbed_launchctl "$ROOT/uninstall.sh" 2>&1)"
+  status=$?
+  uid="$(id -u)"
+  assert_eq "uninstall with stub succeeds" "0" "$status"
+  assert_contains "uninstall reports temp plist path" "$out" "$home_dir/Library/LaunchAgents/com.claude-codex-usage.refresh.plist"
+  assert_eq "uninstall bootout uses launchctl stub" "bootout gui/$uid/com.claude-codex-usage.refresh" "$(cat "$launchctl_log")"
 }
 
 test_json_transform() {
@@ -488,6 +525,24 @@ test_install_config_order() {
   assert_eq "install plist uses configured interval" "30" "$c120"
 }
 
+test_install_launchctl_skip() {
+  home_dir="$tmp/install-skip-home"
+  cfg_home="$tmp/install-skip-config"
+  cache_home="$tmp/install-skip-cache"
+  required_bin="$tmp/install-skip-bin"
+  mkdir -p "$home_dir" "$cfg_home" "$cache_home" "$required_bin"
+  for cmd in jq curl codex osascript; do
+    printf '%s\n' '#!/bin/bash' 'exit 0' >"$required_bin/$cmd"
+    chmod +x "$required_bin/$cmd"
+  done
+  : >"$launchctl_log"
+  out="$(HOME="$home_dir" XDG_CONFIG_HOME="$cfg_home" XDG_CACHE_HOME="$cache_home" PATH="$required_bin:$stub_bin:$PATH" CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL=1 CLAUDE_CODEX_USAGE_LAUNCHCTL_LOG="$launchctl_log" "$ROOT/install.sh" 2>&1)"
+  status=$?
+  assert_eq "install skip launchctl succeeds" "0" "$status"
+  assert_contains "install skip reports temp plist path" "$out" "$home_dir/Library/LaunchAgents/com.claude-codex-usage.refresh.plist"
+  assert_eq "install skip prevents launchctl calls" "0" "$(wc -l <"$launchctl_log" | tr -d ' ')"
+}
+
 test_syntax() {
   for f in refresh.sh tmux-usage.sh install.sh uninstall.sh test/test.sh; do
     if /bin/bash -n "$ROOT/$f"; then
@@ -502,6 +557,7 @@ test_lock_cleanup_trap
 test_invalid_numeric_config_fallback
 test_uninstall_purge_cache_guard
 test_uninstall_purge_cache_canonical_guard
+test_uninstall_launchctl_stub
 test_json_transform
 test_usage_payload_validation
 test_parse_failure_cache
@@ -514,6 +570,7 @@ test_notifications
 test_tmux_display
 test_plist_generation
 test_install_config_order
+test_install_launchctl_skip
 test_syntax
 
 printf 'RESULT pass=%s fail=%s\n' "$PASS" "$FAIL"

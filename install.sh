@@ -186,9 +186,12 @@ write_plist() {
 check_required() {
   local missing cmd
   missing=""
-  for cmd in jq curl codex osascript launchctl; do
+  for cmd in jq curl codex osascript; do
     command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
   done
+  if [ "${CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL:-}" != "1" ]; then
+    command -v launchctl >/dev/null 2>&1 || missing="$missing launchctl"
+  fi
   if [ -n "$missing" ]; then
     printf 'missing required command(s):%s\n' "$missing" >&2
     return 1
@@ -213,10 +216,12 @@ main() {
   write_plist "$env_path" || return 1
   chmod +x "$SCRIPT_DIR/refresh.sh" "$SCRIPT_DIR/tmux-usage.sh" 2>/dev/null
   uid="$(id -u)"
-  launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
-  launchctl bootstrap "gui/$uid" "$PLIST_PATH" >/dev/null 2>&1 || return 4
-  launchctl enable "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
-  launchctl kickstart -k "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
+  if [ "${CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL:-}" != "1" ]; then
+    launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
+    launchctl bootstrap "gui/$uid" "$PLIST_PATH" >/dev/null 2>&1 || return 4
+    launchctl enable "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
+    launchctl kickstart -k "gui/$uid/$LABEL" >/dev/null 2>&1 || return 4
+  fi
   printf 'installed %s\n' "$PLIST_PATH"
   return 0
 }

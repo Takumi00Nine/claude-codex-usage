@@ -111,7 +111,7 @@ main() {
   esac
   load_config
   uid="$(id -u)"
-  if command -v launchctl >/dev/null 2>&1; then
+  if [ "${CLAUDE_CODEX_USAGE_SKIP_LAUNCHCTL:-}" != "1" ] && command -v launchctl >/dev/null 2>&1; then
     launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1
   fi
   if [ -e "$PLIST_PATH" ]; then
